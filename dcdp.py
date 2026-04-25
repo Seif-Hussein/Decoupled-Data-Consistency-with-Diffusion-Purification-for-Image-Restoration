@@ -227,7 +227,7 @@ def Diffusion_Purified_CSGM(model, img_gt, total_num_iterations, csgm_num_iterat
                             use_weight_decay=False, weight_decay_lambda=0, mask=None, full_ddim = True, 
                             ddim_num_iterations=20, purification_schedule='linear', optimizer='Adam', 
                             momentum=0, lr=0.1, save_every_main=50, save_every_sub=1, 
-                            verbose=False, root_path=None):
+                            verbose=False, root_path=None, save_measurements=True):
     '''
     model: The pretrained diffusion model
     img_gt: ground truth image
@@ -257,10 +257,12 @@ def Diffusion_Purified_CSGM(model, img_gt, total_num_iterations, csgm_num_iterat
   
     measurements = measurements+torch.randn(measurements.shape).to(device)*noise_std
     
-    plt.figure()
-    plt.imshow(torch_to_np(normalize_image(measurements)))
-    plt.title('Measurements')
-    plt.savefig(root_path+'measurements.png')
+    if save_measurements:
+        plt.figure()
+        plt.imshow(torch_to_np(normalize_image(measurements)))
+        plt.title('Measurements')
+        plt.savefig(root_path+'measurements.png')
+        plt.close()
 
     x = torch.zeros(img_gt.shape, device=device, requires_grad=True)
     x_list_complete = []
@@ -367,8 +369,20 @@ def main():
                       help='Override the dataset root from the purification config.')
   parser.add_argument('--max_images', type=int, default=10,
                       help='Maximum number of images to process. Use -1 for all images.')
+  parser.add_argument('--start_idx', type=int, default=0,
+                      help='Dataset index to start from before applying max_images.')
   parser.add_argument('--seed', type=int, default=None,
                       help='Random seed for masks, measurement noise, and initialization.')
+  parser.add_argument('--full_ddim_override', choices=['config', 'true', 'false'], default='config',
+                      help='Override purification_config full_ddim. false uses the faster Tweedie step.')
+  parser.add_argument('--ddim_num_iterations_override', type=int, default=None,
+                      help='Override purification_config ddim_num_iterations.')
+  parser.add_argument('--skip_metrics', action='store_true',
+                      help='Skip PSNR/SSIM/LPIPS sweeps over intermediate reconstructions.')
+  parser.add_argument('--save_measurements', action='store_true',
+                      help='Save measurement preview figures.')
+  parser.add_argument('--save_progress_figures', action='store_true',
+                      help='Save per-iteration progress figures.')
   args = parser.parse_args()
 
   # logger
@@ -464,12 +478,18 @@ def main():
   ddim_end_timestep = purification_config['purification']['ddim_end_timestep']
   purification_schedule = purification_config['purification']['purification_schedule']
   ddim_num_iterations = purification_config['purification']['ddim_num_iterations']
+  if args.ddim_num_iterations_override is not None:
+      ddim_num_iterations = args.ddim_num_iterations_override
   save_every_main = purification_config['purification']['save_every_main']
   save_every_sub = purification_config['purification']['save_every_sub']
   optimizer = purification_config['purification']['optimizer']
   lr = purification_config['purification']['lr']
   momentum = purification_config['purification']['momentum']
   full_ddim = purification_config['purification']['full_ddim']
+  if args.full_ddim_override == 'true':
+      full_ddim = True
+  elif args.full_ddim_override == 'false':
+      full_ddim = False
   use_weight_decay = purification_config['purification']['use_weight_decay']
   weight_decay_lambda = purification_config['purification']['weight_decay_lambda']
 
@@ -478,9 +498,13 @@ def main():
       weight_decay_lambda = 0
   path_0 = os.path.join(out_path, dataset_name, 'noise_std_'+str(noise_std), str(ddim_init_timestep)+'_'+str(ddim_end_timestep)+'_'+str(total_num_iterations)+'_'+str(csgm_num_iterations)+'_'+purification_schedule+'_'+str(lr)+'_'+str(momentum)+'_'+str(full_ddim)+'_'+str(ddim_num_iterations)+'_'+str(weight_decay_lambda))
 
+  processed_images = 0
   for i, img in enumerate(loader):
-      if args.max_images >= 0 and i >= args.max_images:
+      if i < args.start_idx:
+         continue
+      if args.max_images >= 0 and processed_images >= args.max_images:
          break
+      processed_images += 1
       img = img.to(device)
       root_path = path_0 + '/img_' + str(i) + '/'
       isExist = os.path.exists(root_path)
@@ -502,7 +526,9 @@ def main():
                                                       mask=mask, full_ddim=full_ddim, ddim_num_iterations=ddim_num_iterations,
                                                       purification_schedule=purification_schedule, optimizer=optimizer,
                                                       momentum=momentum, lr=lr, save_every_main=save_every_main,
-                                                      save_every_sub=save_every_sub, verbose=True, root_path=figure_root_path)
+                                                      save_every_sub=save_every_sub, verbose=args.save_progress_figures,
+                                                      root_path=figure_root_path,
+                                                      save_measurements=args.save_measurements)
       
       # Save the intermediate reconstructions
       torch.save(x_list_complete,root_path+'x_list_complete.pt')
@@ -510,7 +536,7 @@ def main():
       PSNR_list = []
       SSIM_list = []
       LPIPS_list = []
-      if peak_signal_noise_ratio is not None and compare_ssim is not None:
+      if not args.skip_metrics and peak_signal_noise_ratio is not None and compare_ssim is not None:
         img_np = torch_to_np(img)
         img_np = np.clip(img_np,-1,1)
         img_np = (img_np+1)/2

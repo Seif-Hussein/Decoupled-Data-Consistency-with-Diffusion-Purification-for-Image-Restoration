@@ -58,10 +58,16 @@ def main() -> int:
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-images", type=int, default=10)
+    parser.add_argument("--start-idx", type=int, default=0)
     parser.add_argument("--dataset-root", type=Path, default=None)
     parser.add_argument("--save-dir", type=Path, default=repo_root / "purification_results" / "dcdp_defaults")
     parser.add_argument("--model-config", type=Path, default=repo_root / "model_configurations" / "model_config_ffhq.yaml")
     parser.add_argument("--python", type=Path, default=Path(sys.executable))
+    parser.add_argument("--mode", choices=["ddim", "tweedie"], default="ddim")
+    parser.add_argument("--ddim-steps", type=int, default=None)
+    parser.add_argument("--skip-metrics", action="store_true")
+    parser.add_argument("--save-measurements", action="store_true")
+    parser.add_argument("--save-progress-figures", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -89,9 +95,23 @@ def main() -> int:
             str(dataset_root),
             "--max_images",
             str(args.max_images),
+            "--start_idx",
+            str(args.start_idx),
             "--seed",
             str(args.seed),
         ]
+        if args.mode == "tweedie":
+            cmd.extend(["--full_ddim_override", "false"])
+        elif args.mode == "ddim":
+            cmd.extend(["--full_ddim_override", "true"])
+        if args.ddim_steps is not None:
+            cmd.extend(["--ddim_num_iterations_override", str(args.ddim_steps)])
+        if args.skip_metrics:
+            cmd.append("--skip_metrics")
+        if args.save_measurements:
+            cmd.append("--save_measurements")
+        if args.save_progress_figures:
+            cmd.append("--save_progress_figures")
         print(f"\n=== {task_name} ({task['source']} preset) ===")
         print(" ".join(cmd))
         if not args.dry_run:
