@@ -1,0 +1,15 @@
+name: dcdp_repo_phase_retrieval
+
+conditioning:
+  method: ps
+  params:
+    scale: 1
+
+measurement:
+  operator:
+    name: phase_retrieval
+    oversample: 2.0
+
+  noise:
+    name: gaussian
+    sigma: 0.05

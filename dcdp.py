@@ -1,6 +1,7 @@
 from functools import partial
 import os
 import argparse
+import random
 import yaml
 
 import torch
@@ -16,16 +17,27 @@ from guided_diffusion.gaussian_diffusion import create_sampler
 from data.dataloader import get_dataset, get_dataloader
 from util.logger import get_logger
 
-from skimage.metrics import peak_signal_noise_ratio
-from skimage.metrics import structural_similarity as compare_ssim
-from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
-lpips = LearnedPerceptualImagePatchSimilarity(net_type='vgg')
+try:
+  from skimage.metrics import peak_signal_noise_ratio
+  from skimage.metrics import structural_similarity as compare_ssim
+except ImportError:
+  peak_signal_noise_ratio = None
+  compare_ssim = None
+
+try:
+  from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+except ImportError:
+  LearnedPerceptualImagePatchSimilarity = None
+
+lpips = None
 
 def get_lpips(img1, img2, lpips, device):
   '''
   img1: torch.tensor of shape [1,C,H,W]
   img2: torch.tensor of shape [1,C,H,W]
   '''
+  if lpips is None:
+    raise RuntimeError("LPIPS metric is unavailable in the current environment.")
   # Evaluate the lpips on device
   lpips.to(device)
   img1 = torch.clamp(img1, min=-1, max=1).to(device)
@@ -48,6 +60,74 @@ def load_yaml(file_path: str) -> dict:
     with open(file_path) as f:
         config = yaml.load(f, Loader=yaml.FullLoader)
     return config
+
+def set_seed(seed: int):
+  random.seed(seed)
+  np.random.seed(seed)
+  torch.manual_seed(seed)
+  if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(seed)
+
+def _as_pair(value, default):
+  if value is None:
+    value = default
+  if isinstance(value, (int, float)):
+    return int(value), int(value)
+  return int(value[0]), int(value[1])
+
+def _as_float_pair(value, default):
+  if value is None:
+    value = default
+  if isinstance(value, (int, float)):
+    return float(value), float(value)
+  return float(value[0]), float(value[1])
+
+def create_inpainting_mask(mask_opt, img_size, device):
+  '''
+  Build masks with the same conventions as mycode2.measurements.inpainting:
+  random/box masks are generated once and then reused for all images in a run.
+  '''
+  mask_opt = mask_opt or {}
+  _, _, height, width = img_size
+  image_size = int(mask_opt.get('image_size', mask_opt.get('resolution', height)))
+  if image_size != height or image_size != width:
+    raise ValueError(f"Mask image_size={image_size} does not match img_size={img_size}.")
+
+  mask_type = mask_opt.get('mask_type', 'box')
+  mask = torch.ones((1, 1, height, width), device=device)
+
+  if mask_type == 'random':
+    prob_low, prob_high = _as_float_pair(mask_opt.get('mask_prob_range'), (0.3, 0.7))
+    prob = np.random.uniform(prob_low, prob_high)
+    total = height * width
+    samples = np.random.choice(total, int(total * prob), replace=False)
+    mask.view(-1)[torch.as_tensor(samples, device=device, dtype=torch.long)] = 0
+  elif mask_type == 'box':
+    len_low, len_high = _as_pair(mask_opt.get('mask_len_range'), (128, 129))
+    mask_h = int(np.random.randint(len_low, len_high))
+    mask_w = int(np.random.randint(len_low, len_high))
+    margin_h, margin_w = _as_pair(mask_opt.get('margin'), (32, 32))
+    if 'top' in mask_opt and 'left' in mask_opt:
+      top = int(mask_opt['top'])
+      left = int(mask_opt['left'])
+    else:
+      max_t = image_size - margin_h - mask_h
+      max_l = image_size - margin_w - mask_w
+      if max_t <= margin_h or max_l <= margin_w:
+        raise ValueError("Box mask is too large for the requested image size and margin.")
+      top = int(np.random.randint(margin_h, max_t))
+      left = int(np.random.randint(margin_w, max_l))
+    if top < 0 or left < 0 or top + mask_h > height or left + mask_w > width:
+      raise ValueError("Box mask location is outside the image.")
+    mask[..., top:top + mask_h, left:left + mask_w] = 0
+  elif mask_type == 'whole':
+    mask.zero_()
+  elif mask_type == 'extreme':
+    mask = 1.0 - create_inpainting_mask({**mask_opt, 'mask_type': 'box'}, img_size, device)
+  else:
+    raise ValueError(f"Unsupported mask_type '{mask_type}'.")
+
+  return mask
 
 def Purification_Schedule(num_purification_steps, initial_timestep, end_timestep=0, schedule_type='linear'):
   '''
@@ -283,15 +363,38 @@ def main():
   parser.add_argument('--gpu', type=int, default=0)
   parser.add_argument('--save_dir', type=str, default='./purification_results')
   parser.add_argument('--purification_config', type=str)
+  parser.add_argument('--dataset_root', type=str, default=None,
+                      help='Override the dataset root from the purification config.')
+  parser.add_argument('--max_images', type=int, default=10,
+                      help='Maximum number of images to process. Use -1 for all images.')
+  parser.add_argument('--seed', type=int, default=None,
+                      help='Random seed for masks, measurement noise, and initialization.')
   args = parser.parse_args()
 
   # logger
   logger = get_logger()
 
+  if args.seed is not None:
+      set_seed(args.seed)
+      logger.info(f"Seed set to {args.seed}.")
+
   # Device setting
   device_str = f"cuda:{args.gpu}" if torch.cuda.is_available() else 'cpu'
   logger.info(f"Device set to {device_str}.")
   device = torch.device(device_str)  
+
+  global lpips
+  if LearnedPerceptualImagePatchSimilarity is not None:
+      try:
+          lpips = LearnedPerceptualImagePatchSimilarity(net_type='vgg')
+      except Exception as exc:
+          logger.warning(f"LPIPS metric disabled: {exc}")
+          lpips = None
+  else:
+      logger.warning("LPIPS metric disabled: torchmetrics LPIPS is unavailable.")
+
+  if peak_signal_noise_ratio is None or compare_ssim is None:
+      logger.warning("PSNR/SSIM metrics disabled: scikit-image is unavailable.")
 
   # Load configurations
   model_config = load_yaml(args.model_config)
@@ -302,6 +405,11 @@ def main():
   model = create_model(**model_config)
   model = model.to(device)
   model.eval()
+
+  # Match mycode2's measurement simulation order: seed immediately before
+  # operator construction and measurement generation.
+  if args.seed is not None:
+      set_seed(args.seed)
   
   # Prepare Operator and noise
   measure_config = task_config['measurement']
@@ -320,7 +428,8 @@ def main():
   logger.info(f"Conditioning method : {cond_method_name}")
 
   # Working directory
-  out_path = os.path.join(args.save_dir, measure_config['operator']['name'])
+  task_name = task_config.get('name', measure_config['operator']['name'])
+  out_path = os.path.join(args.save_dir, task_name)
   os.makedirs(out_path, exist_ok=True)
 
   img_size = purification_config['others']['img_size']
@@ -328,7 +437,9 @@ def main():
   noise_std = measure_config['noise']['sigma']
 
   # Build dataset
-  data_config = purification_config['dataset']
+  data_config = dict(purification_config['dataset'])
+  if args.dataset_root is not None:
+      data_config['root'] = args.dataset_root
   transform = transforms.Compose([transforms.ToTensor(),
                                   transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
   dataset = get_dataset(**data_config, transforms=transform)
@@ -337,9 +448,8 @@ def main():
 
   inverse_problem_type = measure_config['operator']['name']
   if inverse_problem_type == 'inpainting':
-      mask = torch.ones(img_size)
-      mask[:,:,100:200,100:200] = 0
-      mask = mask.to(device)
+      mask = create_inpainting_mask(task_config['measurement'].get('mask_opt'), img_size, device)
+      logger.info(f"Inpainting mask: {task_config['measurement'].get('mask_opt', {'mask_type': 'box'})}")
   else:
       mask = None
 
@@ -369,7 +479,7 @@ def main():
   path_0 = os.path.join(out_path, dataset_name, 'noise_std_'+str(noise_std), str(ddim_init_timestep)+'_'+str(ddim_end_timestep)+'_'+str(total_num_iterations)+'_'+str(csgm_num_iterations)+'_'+purification_schedule+'_'+str(lr)+'_'+str(momentum)+'_'+str(full_ddim)+'_'+str(ddim_num_iterations)+'_'+str(weight_decay_lambda))
 
   for i, img in enumerate(loader):
-      if i>= 10: #Modify this line if you want to test on more images
+      if args.max_images >= 0 and i >= args.max_images:
          break
       img = img.to(device)
       root_path = path_0 + '/img_' + str(i) + '/'
@@ -381,6 +491,8 @@ def main():
       if not isExist:
           # Create a new directory if it does not exist
           os.makedirs(figure_root_path)        
+      if mask is not None:
+          torch.save(mask.detach().cpu(), root_path + 'mask.pt')
       x, x_list_complete = Diffusion_Purified_CSGM(model, img_gt=img, total_num_iterations=total_num_iterations, 
                                                       csgm_num_iterations=csgm_num_iterations, device=device,
                                                       cond_method=cond_method, ddim_init_timestep=ddim_init_timestep,
@@ -395,97 +507,131 @@ def main():
       # Save the intermediate reconstructions
       torch.save(x_list_complete,root_path+'x_list_complete.pt')
 
-      img_np = torch_to_np(img)
-      img_np = np.clip(img_np,-1,1)
-      img_np = (img_np+1)/2
       PSNR_list = []
       SSIM_list = []
       LPIPS_list = []
-      # Here we calculate the standard metrics on every intermediate reconstrucitons, which is time-costly. Comment the lines below if you want to reconstruct the images at a faster speed.
-      for j in range(len(x_list_complete)):
-        x = x_list_complete[j]
-        recon = x.detach().cpu()
-        recon_np = recon[0].permute(1,2,0).numpy()
-        recon_np = np.clip(recon_np,-1,1)
-        recon_np = (recon_np+1)/2
-        PSNR_list.append(peak_signal_noise_ratio(img_np,recon_np))
-        SSIM_list.append(compare_ssim(img_np, recon_np, channel_axis=2, data_range=1, gaussian_weights=True, sigma=1.5, use_sample_covariance=False))
-        LPIPS_list.append(get_lpips(img,recon,lpips=lpips,device=device))
+      if peak_signal_noise_ratio is not None and compare_ssim is not None:
+        img_np = torch_to_np(img)
+        img_np = np.clip(img_np,-1,1)
+        img_np = (img_np+1)/2
 
-      # Visualize PSNR, SSIM and LPIPS
-      plt.figure(figsize=(30,10))
-      plt.subplot(131)
-      plt.plot(PSNR_list)
-      plt.xlabel('Iteration/10')
-      plt.title('CSGM Results for '+ inverse_problem_type+' (PSNR)')
+        # Here we calculate the standard metrics on every intermediate reconstrucitons, which is time-costly.
+        for j in range(len(x_list_complete)):
+          x = x_list_complete[j]
+          recon = x.detach().cpu()
+          recon_np = recon[0].permute(1,2,0).numpy()
+          recon_np = np.clip(recon_np,-1,1)
+          recon_np = (recon_np+1)/2
+          PSNR_list.append(peak_signal_noise_ratio(img_np,recon_np))
+          SSIM_list.append(compare_ssim(img_np, recon_np, channel_axis=2, data_range=1, gaussian_weights=True, sigma=1.5, use_sample_covariance=False))
+          if lpips is not None:
+            LPIPS_list.append(get_lpips(img,recon,lpips=lpips,device=device))
 
-      plt.subplot(132)
-      plt.plot(SSIM_list)
-      plt.xlabel('Iteration/10')
-      plt.title('CSGM Results for '+ inverse_problem_type+' (SSIM)')
+        if lpips is not None and len(LPIPS_list) > 0:
+          plt.figure(figsize=(30,10))
+          plt.subplot(131)
+          plt.plot(PSNR_list)
+          plt.xlabel('Iteration/10')
+          plt.title('CSGM Results for '+ inverse_problem_type+' (PSNR)')
 
-      plt.subplot(133)
-      plt.plot(LPIPS_list)
-      plt.xlabel('Iteration/10')
-      plt.title('CSGM Results for '+ inverse_problem_type+' (LPIPS)')
-      plt.savefig(figure_root_path+'metrics.png')
-      
-      print('Final PSNR: ',PSNR_list[-1],'Final SSIM: ',SSIM_list[-1],'Final LPIPS: ',LPIPS_list[-1])
+          plt.subplot(132)
+          plt.plot(SSIM_list)
+          plt.xlabel('Iteration/10')
+          plt.title('CSGM Results for '+ inverse_problem_type+' (SSIM)')
 
-      PSNR_list = np.array(PSNR_list)
-      SSIM_list = np.array(SSIM_list)
-      LPIPS_list = np.array(LPIPS_list)
-      torch.save(PSNR_list, root_path+'/PSNR_list.pt')
-      torch.save(SSIM_list, root_path+'/SSIM_list.pt')
-      torch.save(LPIPS_list, root_path+'/LPIPS_list.pt')
+          plt.subplot(133)
+          plt.plot(LPIPS_list)
+          plt.xlabel('Iteration/10')
+          plt.title('CSGM Results for '+ inverse_problem_type+' (LPIPS)')
+          plt.savefig(figure_root_path+'metrics.png')
 
-      PSNR_list_All.append(PSNR_list)
-      SSIM_list_All.append(SSIM_list)
-      LPIPS_list_All.append(LPIPS_list)
-  PSNR_list_All = np.array(PSNR_list_All)
-  SSIM_list_All = np.array(SSIM_list_All)
-  LPIPS_list_All = np.array(LPIPS_list_All)
+          print('Final PSNR: ',PSNR_list[-1],'Final SSIM: ',SSIM_list[-1],'Final LPIPS: ',LPIPS_list[-1])
+        else:
+          plt.figure(figsize=(20,10))
+          plt.subplot(121)
+          plt.plot(PSNR_list)
+          plt.xlabel('Iteration/10')
+          plt.title('CSGM Results for '+ inverse_problem_type+' (PSNR)')
 
-  avg_PSNR_list = np.mean(PSNR_list_All, axis=0)
-  std_PSNR_list = np.std(PSNR_list_All, axis=0)
+          plt.subplot(122)
+          plt.plot(SSIM_list)
+          plt.xlabel('Iteration/10')
+          plt.title('CSGM Results for '+ inverse_problem_type+' (SSIM)')
+          plt.savefig(figure_root_path+'metrics.png')
 
-  avg_SSIM_list = np.mean(SSIM_list_All, axis=0)
-  std_SSIM_list = np.std(SSIM_list_All, axis=0)
+          print('Final PSNR: ',PSNR_list[-1],'Final SSIM: ',SSIM_list[-1])
 
-  avg_LPIPS_list = np.mean(LPIPS_list_All, axis=0)
-  std_LPIPS_list = np.mean(LPIPS_list_All, axis=0)
+        PSNR_list = np.array(PSNR_list)
+        SSIM_list = np.array(SSIM_list)
+        torch.save(PSNR_list, root_path+'/PSNR_list.pt')
+        torch.save(SSIM_list, root_path+'/SSIM_list.pt')
+        PSNR_list_All.append(PSNR_list)
+        SSIM_list_All.append(SSIM_list)
 
-  print('When the measurement has additional noise, the purification in the last iteration can improve the final reconstruction quality. Otherwise, applying purification in the last iteration can degrade reconstruction quality.')
+        if len(LPIPS_list) > 0:
+          LPIPS_list = np.array(LPIPS_list)
+          torch.save(LPIPS_list, root_path+'/LPIPS_list.pt')
+          LPIPS_list_All.append(LPIPS_list)
+  if len(PSNR_list_All) > 0 and len(SSIM_list_All) > 0:
+      PSNR_list_All = np.array(PSNR_list_All)
+      SSIM_list_All = np.array(SSIM_list_All)
+      avg_PSNR_list = np.mean(PSNR_list_All, axis=0)
+      std_PSNR_list = np.std(PSNR_list_All, axis=0)
 
-  print('Final Metrics before Purification:')
-  print('Final average PSNR: ',avg_PSNR_list[-2],'Final average SSIM: ', avg_SSIM_list[-2],'Final average LPIPS: ',avg_LPIPS_list[-2])
-  print('Final std PSNR: ',std_PSNR_list[-2],'Final std SSIM: ', std_SSIM_list[-2],'Final std LPIPS: ',std_LPIPS_list[-2])
+      avg_SSIM_list = np.mean(SSIM_list_All, axis=0)
+      std_SSIM_list = np.std(SSIM_list_All, axis=0)
 
-  print('Final Metrics after Purification:')
-  print('Final average PSNR: ',avg_PSNR_list[-1],'Final average SSIM: ', avg_SSIM_list[-1],'Final average LPIPS: ',avg_LPIPS_list[-1])
-  print('Final std PSNR: ',std_PSNR_list[-1],'Final std SSIM: ', std_SSIM_list[-1],'Final std LPIPS: ',std_LPIPS_list[-1])
+      print('When the measurement has additional noise, the purification in the last iteration can improve the final reconstruction quality. Otherwise, applying purification in the last iteration can degrade reconstruction quality.')
 
-  plt.figure(figsize=(30,10))
-  plt.subplot(131)
-  plt.plot(avg_PSNR_list)
-  plt.xlabel('Iteration')
-  plt.title('PSNR')
+      print('Final Metrics before Purification:')
+      print('Final average PSNR: ',avg_PSNR_list[-2],'Final average SSIM: ', avg_SSIM_list[-2])
+      print('Final std PSNR: ',std_PSNR_list[-2],'Final std SSIM: ', std_SSIM_list[-2])
 
-  plt.subplot(132)
-  plt.plot(avg_SSIM_list)
-  plt.xlabel('Iteration')
-  plt.title('SSIM')
+      print('Final Metrics after Purification:')
+      print('Final average PSNR: ',avg_PSNR_list[-1],'Final average SSIM: ', avg_SSIM_list[-1])
+      print('Final std PSNR: ',std_PSNR_list[-1],'Final std SSIM: ', std_SSIM_list[-1])
 
-  plt.subplot(133)
-  plt.plot(avg_LPIPS_list)
-  plt.xlabel('Iteration/5')
-  plt.title('LPIPS')
-      
-  plt.savefig(path_0+'/avg_metrics.png')
+      if len(LPIPS_list_All) > 0:
+          LPIPS_list_All = np.array(LPIPS_list_All)
+          avg_LPIPS_list = np.mean(LPIPS_list_All, axis=0)
+          std_LPIPS_list = np.mean(LPIPS_list_All, axis=0)
+          print('Final average LPIPS before Purification: ',avg_LPIPS_list[-2])
+          print('Final average LPIPS after Purification: ',avg_LPIPS_list[-1])
+          print('Final std LPIPS before Purification: ',std_LPIPS_list[-2])
+          print('Final std LPIPS after Purification: ',std_LPIPS_list[-1])
 
-  torch.save(avg_PSNR_list, path_0 + '/avg_PSNR_list.pt')
-  torch.save(avg_SSIM_list, path_0 + '/avg_SSIM_list.pt')
-  torch.save(avg_LPIPS_list, path_0 + '/avg_LPIPS_list.pt')    
+          plt.figure(figsize=(30,10))
+          plt.subplot(131)
+          plt.plot(avg_PSNR_list)
+          plt.xlabel('Iteration')
+          plt.title('PSNR')
+
+          plt.subplot(132)
+          plt.plot(avg_SSIM_list)
+          plt.xlabel('Iteration')
+          plt.title('SSIM')
+
+          plt.subplot(133)
+          plt.plot(avg_LPIPS_list)
+          plt.xlabel('Iteration/5')
+          plt.title('LPIPS')
+
+          torch.save(avg_LPIPS_list, path_0 + '/avg_LPIPS_list.pt')
+      else:
+          plt.figure(figsize=(20,10))
+          plt.subplot(121)
+          plt.plot(avg_PSNR_list)
+          plt.xlabel('Iteration')
+          plt.title('PSNR')
+
+          plt.subplot(122)
+          plt.plot(avg_SSIM_list)
+          plt.xlabel('Iteration')
+          plt.title('SSIM')
+
+      plt.savefig(path_0+'/avg_metrics.png')
+      torch.save(avg_PSNR_list, path_0 + '/avg_PSNR_list.pt')
+      torch.save(avg_SSIM_list, path_0 + '/avg_SSIM_list.pt')
 
 
 if __name__ == '__main__':
