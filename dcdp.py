@@ -1,7 +1,10 @@
 from functools import partial
 import os
 import argparse
+from datetime import datetime, timezone
+import json
 import random
+import time
 import yaml
 
 import torch
@@ -67,6 +70,34 @@ def set_seed(seed: int):
   torch.manual_seed(seed)
   if torch.cuda.is_available():
     torch.cuda.manual_seed_all(seed)
+
+def utc_now_iso():
+  return datetime.now(timezone.utc).isoformat()
+
+def _json_default(obj):
+  if isinstance(obj, np.ndarray):
+    return obj.tolist()
+  if isinstance(obj, np.integer):
+    return int(obj)
+  if isinstance(obj, np.floating):
+    return float(obj)
+  raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+def write_json(path, payload):
+  os.makedirs(os.path.dirname(path), exist_ok=True)
+  tmp_path = path + '.tmp'
+  with open(tmp_path, 'w', encoding='utf-8') as f:
+    json.dump(payload, f, indent=2, sort_keys=True, default=_json_default)
+  os.replace(tmp_path, path)
+
+def elapsed_summary(records, target_images):
+  completed = len(records)
+  elapsed_values = [record['elapsed_seconds'] for record in records if 'elapsed_seconds' in record]
+  avg_elapsed = sum(elapsed_values) / completed if completed > 0 else None
+  eta_seconds = None
+  if avg_elapsed is not None and target_images is not None:
+    eta_seconds = max(target_images - completed, 0) * avg_elapsed
+  return avg_elapsed, eta_seconds
 
 def _as_pair(value, default):
   if value is None:
@@ -498,6 +529,69 @@ def main():
       weight_decay_lambda = 0
   path_0 = os.path.join(out_path, dataset_name, 'noise_std_'+str(noise_std), str(ddim_init_timestep)+'_'+str(ddim_end_timestep)+'_'+str(total_num_iterations)+'_'+str(csgm_num_iterations)+'_'+purification_schedule+'_'+str(lr)+'_'+str(momentum)+'_'+str(full_ddim)+'_'+str(ddim_num_iterations)+'_'+str(weight_decay_lambda))
 
+  try:
+      dataset_count = len(dataset)
+  except TypeError:
+      dataset_count = None
+  if dataset_count is None:
+      target_images = args.max_images if args.max_images >= 0 else None
+  else:
+      available_images = max(dataset_count - args.start_idx, 0)
+      target_images = available_images if args.max_images < 0 else min(args.max_images, available_images)
+
+  progress_json = os.path.join(out_path, 'progress.json')
+  history_json = os.path.join(out_path, 'history.json')
+  run_started_at = utc_now_iso()
+  run_start_time = time.perf_counter()
+  run_id = run_started_at.replace(':', '').replace('+', 'Z') + '_' + task_name
+  run_summary = {
+      'run_id': run_id,
+      'task_name': task_name,
+      'inverse_problem_type': inverse_problem_type,
+      'dataset_name': dataset_name,
+      'dataset_root': data_config.get('root'),
+      'dataset_count': dataset_count,
+      'start_idx': args.start_idx,
+      'max_images': args.max_images,
+      'target_images': target_images,
+      'seed': args.seed,
+      'mode': 'ddim' if full_ddim else 'tweedie',
+      'noise_std': noise_std,
+      'skip_metrics': args.skip_metrics,
+      'save_measurements': args.save_measurements,
+      'save_progress_figures': args.save_progress_figures,
+      'output_dir': out_path,
+      'run_output_dir': path_0,
+      'started_at': run_started_at,
+      'hyperparameters': {
+          'total_num_iterations': total_num_iterations,
+          'csgm_num_iterations': csgm_num_iterations,
+          'ddim_init_timestep': ddim_init_timestep,
+          'ddim_end_timestep': ddim_end_timestep,
+          'ddim_num_iterations': ddim_num_iterations,
+          'purification_schedule': purification_schedule,
+          'optimizer': optimizer,
+          'lr': lr,
+          'momentum': momentum,
+          'full_ddim': full_ddim,
+          'use_weight_decay': use_weight_decay,
+          'weight_decay_lambda': weight_decay_lambda,
+      },
+  }
+  history_records = []
+  write_json(history_json, {'run': run_summary, 'images': history_records})
+  write_json(progress_json, {
+      'run': run_summary,
+      'status': 'starting',
+      'completed_images': 0,
+      'current_image_index': None,
+      'current_image_path': None,
+      'avg_elapsed_seconds_per_image': None,
+      'eta_seconds': None,
+      'history_json': history_json,
+      'updated_at': utc_now_iso(),
+  })
+
   processed_images = 0
   for i, img in enumerate(loader):
       if i < args.start_idx:
@@ -505,6 +599,8 @@ def main():
       if args.max_images >= 0 and processed_images >= args.max_images:
          break
       processed_images += 1
+      image_started_at = utc_now_iso()
+      image_start_time = time.perf_counter()
       img = img.to(device)
       root_path = path_0 + '/img_' + str(i) + '/'
       isExist = os.path.exists(root_path)
@@ -517,7 +613,26 @@ def main():
           os.makedirs(figure_root_path)        
       if mask is not None:
           torch.save(mask.detach().cpu(), root_path + 'mask.pt')
-      x, x_list_complete = Diffusion_Purified_CSGM(model, img_gt=img, total_num_iterations=total_num_iterations, 
+      image_path = None
+      if hasattr(dataset, 'fpaths') and i < len(dataset.fpaths):
+          image_path = dataset.fpaths[i]
+      avg_elapsed, eta_seconds = elapsed_summary(history_records, target_images)
+      write_json(progress_json, {
+          'run': run_summary,
+          'status': 'running',
+          'completed_images': processed_images - 1,
+          'current_image_index': i,
+          'current_processed_image': processed_images,
+          'current_image_path': image_path,
+          'avg_elapsed_seconds_per_image': avg_elapsed,
+          'eta_seconds': eta_seconds,
+          'history_json': history_json,
+          'updated_at': utc_now_iso(),
+      })
+
+      try:
+        solver_start_time = time.perf_counter()
+        x, x_list_complete = Diffusion_Purified_CSGM(model, img_gt=img, total_num_iterations=total_num_iterations,
                                                       csgm_num_iterations=csgm_num_iterations, device=device,
                                                       cond_method=cond_method, ddim_init_timestep=ddim_init_timestep,
                                                       ddim_end_timestep=ddim_end_timestep, operator=operator,
@@ -529,75 +644,131 @@ def main():
                                                       save_every_sub=save_every_sub, verbose=args.save_progress_figures,
                                                       root_path=figure_root_path,
                                                       save_measurements=args.save_measurements)
+        solver_elapsed_seconds = time.perf_counter() - solver_start_time
       
-      # Save the intermediate reconstructions
-      torch.save(x_list_complete,root_path+'x_list_complete.pt')
+        # Save the intermediate reconstructions
+        torch.save(x_list_complete,root_path+'x_list_complete.pt')
 
-      PSNR_list = []
-      SSIM_list = []
-      LPIPS_list = []
-      if not args.skip_metrics and peak_signal_noise_ratio is not None and compare_ssim is not None:
-        img_np = torch_to_np(img)
-        img_np = np.clip(img_np,-1,1)
-        img_np = (img_np+1)/2
+        metrics_start_time = time.perf_counter()
+        final_metrics = {}
+        PSNR_list = []
+        SSIM_list = []
+        LPIPS_list = []
+        if not args.skip_metrics and peak_signal_noise_ratio is not None and compare_ssim is not None:
+          img_np = torch_to_np(img)
+          img_np = np.clip(img_np,-1,1)
+          img_np = (img_np+1)/2
 
-        # Here we calculate the standard metrics on every intermediate reconstrucitons, which is time-costly.
-        for j in range(len(x_list_complete)):
-          x = x_list_complete[j]
-          recon = x.detach().cpu()
-          recon_np = recon[0].permute(1,2,0).numpy()
-          recon_np = np.clip(recon_np,-1,1)
-          recon_np = (recon_np+1)/2
-          PSNR_list.append(peak_signal_noise_ratio(img_np,recon_np))
-          SSIM_list.append(compare_ssim(img_np, recon_np, channel_axis=2, data_range=1, gaussian_weights=True, sigma=1.5, use_sample_covariance=False))
-          if lpips is not None:
-            LPIPS_list.append(get_lpips(img,recon,lpips=lpips,device=device))
+          # Here we calculate the standard metrics on every intermediate reconstrucitons, which is time-costly.
+          for j in range(len(x_list_complete)):
+            x = x_list_complete[j]
+            recon = x.detach().cpu()
+            recon_np = recon[0].permute(1,2,0).numpy()
+            recon_np = np.clip(recon_np,-1,1)
+            recon_np = (recon_np+1)/2
+            PSNR_list.append(peak_signal_noise_ratio(img_np,recon_np))
+            SSIM_list.append(compare_ssim(img_np, recon_np, channel_axis=2, data_range=1, gaussian_weights=True, sigma=1.5, use_sample_covariance=False))
+            if lpips is not None:
+              LPIPS_list.append(get_lpips(img,recon,lpips=lpips,device=device))
 
-        if lpips is not None and len(LPIPS_list) > 0:
-          plt.figure(figsize=(30,10))
-          plt.subplot(131)
-          plt.plot(PSNR_list)
-          plt.xlabel('Iteration/10')
-          plt.title('CSGM Results for '+ inverse_problem_type+' (PSNR)')
+          if lpips is not None and len(LPIPS_list) > 0:
+            plt.figure(figsize=(30,10))
+            plt.subplot(131)
+            plt.plot(PSNR_list)
+            plt.xlabel('Iteration/10')
+            plt.title('CSGM Results for '+ inverse_problem_type+' (PSNR)')
 
-          plt.subplot(132)
-          plt.plot(SSIM_list)
-          plt.xlabel('Iteration/10')
-          plt.title('CSGM Results for '+ inverse_problem_type+' (SSIM)')
+            plt.subplot(132)
+            plt.plot(SSIM_list)
+            plt.xlabel('Iteration/10')
+            plt.title('CSGM Results for '+ inverse_problem_type+' (SSIM)')
 
-          plt.subplot(133)
-          plt.plot(LPIPS_list)
-          plt.xlabel('Iteration/10')
-          plt.title('CSGM Results for '+ inverse_problem_type+' (LPIPS)')
-          plt.savefig(figure_root_path+'metrics.png')
+            plt.subplot(133)
+            plt.plot(LPIPS_list)
+            plt.xlabel('Iteration/10')
+            plt.title('CSGM Results for '+ inverse_problem_type+' (LPIPS)')
+            plt.savefig(figure_root_path+'metrics.png')
 
-          print('Final PSNR: ',PSNR_list[-1],'Final SSIM: ',SSIM_list[-1],'Final LPIPS: ',LPIPS_list[-1])
-        else:
-          plt.figure(figsize=(20,10))
-          plt.subplot(121)
-          plt.plot(PSNR_list)
-          plt.xlabel('Iteration/10')
-          plt.title('CSGM Results for '+ inverse_problem_type+' (PSNR)')
+            print('Final PSNR: ',PSNR_list[-1],'Final SSIM: ',SSIM_list[-1],'Final LPIPS: ',LPIPS_list[-1])
+          else:
+            plt.figure(figsize=(20,10))
+            plt.subplot(121)
+            plt.plot(PSNR_list)
+            plt.xlabel('Iteration/10')
+            plt.title('CSGM Results for '+ inverse_problem_type+' (PSNR)')
 
-          plt.subplot(122)
-          plt.plot(SSIM_list)
-          plt.xlabel('Iteration/10')
-          plt.title('CSGM Results for '+ inverse_problem_type+' (SSIM)')
-          plt.savefig(figure_root_path+'metrics.png')
+            plt.subplot(122)
+            plt.plot(SSIM_list)
+            plt.xlabel('Iteration/10')
+            plt.title('CSGM Results for '+ inverse_problem_type+' (SSIM)')
+            plt.savefig(figure_root_path+'metrics.png')
 
-          print('Final PSNR: ',PSNR_list[-1],'Final SSIM: ',SSIM_list[-1])
+            print('Final PSNR: ',PSNR_list[-1],'Final SSIM: ',SSIM_list[-1])
 
-        PSNR_list = np.array(PSNR_list)
-        SSIM_list = np.array(SSIM_list)
-        torch.save(PSNR_list, root_path+'/PSNR_list.pt')
-        torch.save(SSIM_list, root_path+'/SSIM_list.pt')
-        PSNR_list_All.append(PSNR_list)
-        SSIM_list_All.append(SSIM_list)
+          final_metrics = {
+              'final_psnr': float(PSNR_list[-1]),
+              'final_ssim': float(SSIM_list[-1]),
+          }
+          if len(LPIPS_list) > 0:
+              final_metrics['final_lpips'] = float(np.asarray(LPIPS_list[-1]).reshape(-1)[0])
 
-        if len(LPIPS_list) > 0:
           LPIPS_list = np.array(LPIPS_list)
-          torch.save(LPIPS_list, root_path+'/LPIPS_list.pt')
-          LPIPS_list_All.append(LPIPS_list)
+          PSNR_list = np.array(PSNR_list)
+          SSIM_list = np.array(SSIM_list)
+          torch.save(PSNR_list, root_path+'/PSNR_list.pt')
+          torch.save(SSIM_list, root_path+'/SSIM_list.pt')
+          PSNR_list_All.append(PSNR_list)
+          SSIM_list_All.append(SSIM_list)
+
+          if len(LPIPS_list) > 0:
+            torch.save(LPIPS_list, root_path+'/LPIPS_list.pt')
+            LPIPS_list_All.append(LPIPS_list)
+        metrics_elapsed_seconds = time.perf_counter() - metrics_start_time
+        image_elapsed_seconds = time.perf_counter() - image_start_time
+        image_record = {
+            'dataset_index': i,
+            'processed_image': processed_images,
+            'image_path': image_path,
+            'output_dir': root_path,
+            'started_at': image_started_at,
+            'ended_at': utc_now_iso(),
+            'elapsed_seconds': image_elapsed_seconds,
+            'solver_elapsed_seconds': solver_elapsed_seconds,
+            'metrics_elapsed_seconds': metrics_elapsed_seconds,
+            'num_saved_reconstructions': len(x_list_complete),
+            'metrics': final_metrics,
+        }
+        history_records.append(image_record)
+        write_json(history_json, {'run': run_summary, 'images': history_records})
+        avg_elapsed, eta_seconds = elapsed_summary(history_records, target_images)
+        write_json(progress_json, {
+            'run': run_summary,
+            'status': 'running',
+            'completed_images': processed_images,
+            'current_image_index': None,
+            'current_image_path': None,
+            'last_image': image_record,
+            'avg_elapsed_seconds_per_image': avg_elapsed,
+            'eta_seconds': eta_seconds,
+            'history_json': history_json,
+            'updated_at': utc_now_iso(),
+        })
+      except Exception as exc:
+        avg_elapsed, eta_seconds = elapsed_summary(history_records, target_images)
+        write_json(progress_json, {
+            'run': run_summary,
+            'status': 'failed',
+            'completed_images': processed_images - 1,
+            'current_image_index': i,
+            'current_processed_image': processed_images,
+            'current_image_path': image_path,
+            'error': repr(exc),
+            'avg_elapsed_seconds_per_image': avg_elapsed,
+            'eta_seconds': eta_seconds,
+            'history_json': history_json,
+            'updated_at': utc_now_iso(),
+        })
+        raise
   if len(PSNR_list_All) > 0 and len(SSIM_list_All) > 0:
       PSNR_list_All = np.array(PSNR_list_All)
       SSIM_list_All = np.array(SSIM_list_All)
@@ -658,6 +829,24 @@ def main():
       plt.savefig(path_0+'/avg_metrics.png')
       torch.save(avg_PSNR_list, path_0 + '/avg_PSNR_list.pt')
       torch.save(avg_SSIM_list, path_0 + '/avg_SSIM_list.pt')
+
+  avg_elapsed, eta_seconds = elapsed_summary(history_records, target_images)
+  run_summary['ended_at'] = utc_now_iso()
+  run_summary['run_elapsed_seconds'] = time.perf_counter() - run_start_time
+  run_summary['completed_images'] = processed_images
+  write_json(history_json, {'run': run_summary, 'images': history_records})
+  write_json(progress_json, {
+      'run': run_summary,
+      'status': 'completed',
+      'completed_images': processed_images,
+      'current_image_index': None,
+      'current_image_path': None,
+      'last_image': history_records[-1] if len(history_records) > 0 else None,
+      'avg_elapsed_seconds_per_image': avg_elapsed,
+      'eta_seconds': eta_seconds,
+      'history_json': history_json,
+      'updated_at': utc_now_iso(),
+  })
 
 
 if __name__ == '__main__':

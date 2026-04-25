@@ -113,6 +113,8 @@ def main() -> int:
         if args.save_progress_figures:
             cmd.append("--save_progress_figures")
         print(f"\n=== {task_name} ({task['source']} preset) ===")
+        print(f"Progress JSON: {args.save_dir / task_name / 'progress.json'}")
+        print(f"History JSON: {args.save_dir / task_name / 'history.json'}")
         print(" ".join(cmd))
         if not args.dry_run:
             subprocess.run(cmd, cwd=repo_root, check=True)
