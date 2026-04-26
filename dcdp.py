@@ -651,6 +651,8 @@ def main():
       'seed': args.seed,
       'mode': 'ddim' if full_ddim else 'tweedie',
       'noise_std': noise_std,
+      'measurement_operator': dict(measure_config['operator']),
+      'measurement_noise': dict(measure_config['noise']),
       'skip_metrics': args.skip_metrics,
       'final_metrics': args.final_metrics,
       'save_measurements': args.save_measurements,

@@ -1,4 +1,4 @@
-name: dcdp_repo_phase_retrieval
+name: dcdp_mycode2_phase_retrieval
 
 conditioning:
   method: ps
@@ -9,6 +9,8 @@ measurement:
   operator:
     name: phase_retrieval
     oversample: 2.0
+    resolution: 256
+    input_range: zero_one
 
   noise:
     name: gaussian

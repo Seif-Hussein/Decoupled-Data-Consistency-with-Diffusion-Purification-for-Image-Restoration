@@ -38,8 +38,8 @@ TASKS = {
     "phase_retrieval": {
         "task_config": "task_configurations/dcdp_repo_phase_retrieval_config.yaml",
         "purification_config": "purification_configurations/purification_config_phase_retrieval.yaml",
-        "output_name": "dcdp_repo_phase_retrieval",
-        "source": "repo",
+        "output_name": "dcdp_mycode2_phase_retrieval",
+        "source": "mycode2 measurement + repo hyperparameters",
     },
 }
 
