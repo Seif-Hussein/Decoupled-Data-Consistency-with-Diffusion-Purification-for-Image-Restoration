@@ -135,6 +135,7 @@ def main() -> int:
         print(f"Progress JSON: {args.save_dir / output_name / 'progress.json'}")
         print(f"History JSON: {args.save_dir / output_name / 'history.json'}")
         print(f"Quality history JSON: {args.save_dir / output_name / 'quality_history.json'}")
+        print(f"Metric history JSON: {args.save_dir / output_name / 'metric_history.json'}")
         print(f"Generated images zip: {args.save_dir / output_name / 'generated_images.zip'}")
         print(" ".join(cmd))
         if not args.dry_run:

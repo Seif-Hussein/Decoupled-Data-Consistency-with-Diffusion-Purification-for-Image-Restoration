@@ -180,6 +180,73 @@ def compute_quality_history_records(gt_batch, recon_batches, trace_records, lpip
       records_by_sample[sample_idx].append(record)
   return records_by_sample
 
+def build_metric_history_from_quality_records(quality_records):
+  buckets = {}
+  for image_record in quality_records:
+    history = image_record.get('history', [])
+    batch_size = max(int(image_record.get('batch_size', 1) or 1), 1)
+    for fallback_idx, point in enumerate(history):
+      checkpoint_idx = int(point.get('checkpoint_index', fallback_idx))
+      bucket = buckets.setdefault(checkpoint_idx, {
+          'elapsed_seconds_per_image': [],
+          'psnr': [],
+          'ssim': [],
+          'lpips': [],
+          'trace': point,
+      })
+      elapsed_seconds = point.get('elapsed_seconds')
+      if isinstance(elapsed_seconds, (int, float)):
+        bucket['elapsed_seconds_per_image'].append(float(elapsed_seconds) / batch_size)
+      for metric_name in ['psnr', 'ssim', 'lpips']:
+        metric_value = point.get(metric_name)
+        if isinstance(metric_value, (int, float)):
+          bucket[metric_name].append(float(metric_value))
+
+  metric_history = {
+      'step': [],
+      'stage': [],
+      'main_iteration': [],
+      'sub_iteration': [],
+      'ddim_timestep': [],
+      'elapsed_seconds_per_image': [],
+      'x_k_psnr': [],
+      'x_k_ssim': [],
+      'x_k_lpips': [],
+      'z_k_psnr': [],
+      'z_k_ssim': [],
+      'z_k_lpips': [],
+  }
+  for checkpoint_idx in sorted(buckets):
+    bucket = buckets[checkpoint_idx]
+    trace = bucket.get('trace', {})
+    metric_history['step'].append(checkpoint_idx + 1)
+    metric_history['stage'].append(trace.get('stage'))
+    metric_history['main_iteration'].append(trace.get('main_iteration'))
+    metric_history['sub_iteration'].append(trace.get('sub_iteration'))
+    metric_history['ddim_timestep'].append(trace.get('ddim_timestep'))
+    elapsed_values = bucket['elapsed_seconds_per_image']
+    metric_history['elapsed_seconds_per_image'].append(
+        float(sum(elapsed_values) / len(elapsed_values)) if elapsed_values else None
+    )
+    for metric_name in ['psnr', 'ssim', 'lpips']:
+      values = bucket[metric_name]
+      mean_value = float(sum(values) / len(values)) if values else None
+      metric_history[f'x_k_{metric_name}'].append(mean_value)
+      # The PDHG table notebook chooses x_k for PDHG and z_k otherwise.
+      # DCDP has one reconstruction stream, so expose both names identically.
+      metric_history[f'z_k_{metric_name}'].append(mean_value)
+  return metric_history
+
+def latest_metric_history_metrics(metric_history):
+  latest = {}
+  if not metric_history:
+    return latest
+  for key in ['x_k_psnr', 'x_k_ssim', 'x_k_lpips', 'z_k_psnr', 'z_k_ssim', 'z_k_lpips']:
+    values = metric_history.get(key, [])
+    if isinstance(values, list) and values and values[-1] is not None:
+      latest[key] = values[-1]
+  return latest
+
 def _as_pair(value, default):
   if value is None:
     value = default
@@ -666,6 +733,7 @@ def main():
   progress_json = os.path.join(out_path, 'progress.json')
   history_json = os.path.join(out_path, 'history.json')
   quality_history_json = os.path.join(out_path, 'quality_history.json')
+  metric_history_json = os.path.join(out_path, 'metric_history.json')
   generated_images_dir = os.path.join(out_path, 'generated_images')
   generated_images_zip = os.path.join(out_path, 'generated_images.zip')
   os.makedirs(generated_images_dir, exist_ok=True)
@@ -702,6 +770,7 @@ def main():
       'output_dir': out_path,
       'run_output_dir': path_0,
       'quality_history_json': quality_history_json,
+      'metric_history_json': metric_history_json,
       'quality_history_checkpointing': {
           'enabled': args.save_quality_history,
           'x_axis': 'elapsed_seconds',
@@ -730,10 +799,12 @@ def main():
   }
   history_records = []
   quality_history_records = []
+  metric_history = build_metric_history_from_quality_records(quality_history_records)
   generated_image_records = []
   write_image_zip(generated_image_records, generated_images_zip)
   write_json(history_json, {'run': run_summary, 'images': history_records})
   write_json(quality_history_json, {'run': run_summary, 'images': quality_history_records})
+  write_json(metric_history_json, metric_history)
   write_json(progress_json, {
       'run': run_summary,
       'status': 'starting',
@@ -744,6 +815,8 @@ def main():
       'eta_seconds': None,
       'history_json': history_json,
       'quality_history_json': quality_history_json,
+      'metric_history_json': metric_history_json,
+      'latest_metrics': latest_metric_history_metrics(metric_history),
       'generated_images_dir': generated_images_dir,
       'generated_images_zip': generated_images_zip,
       'updated_at': utc_now_iso(),
@@ -799,6 +872,8 @@ def main():
           'eta_seconds': eta_seconds,
           'history_json': history_json,
           'quality_history_json': quality_history_json,
+          'metric_history_json': metric_history_json,
+          'latest_metrics': latest_metric_history_metrics(metric_history),
           'generated_images_dir': generated_images_dir,
           'generated_images_zip': generated_images_zip,
           'updated_at': utc_now_iso(),
@@ -963,13 +1038,16 @@ def main():
                 'image_path': batch_image_paths[sample_offset],
                 'generated_image': generated['path'],
                 'output_dir': root_path,
+                'batch_size': batch_count,
                 'history': sample_quality_history,
             })
           new_image_records.append(image_record)
         history_records.extend(new_image_records)
         quality_history_records.extend(new_quality_history_records)
+        metric_history = build_metric_history_from_quality_records(quality_history_records)
         write_json(history_json, {'run': run_summary, 'images': history_records})
         write_json(quality_history_json, {'run': run_summary, 'images': quality_history_records})
+        write_json(metric_history_json, metric_history)
         avg_elapsed, eta_seconds = elapsed_summary(history_records, target_images)
         write_json(progress_json, {
             'run': run_summary,
@@ -982,6 +1060,12 @@ def main():
             'eta_seconds': eta_seconds,
             'history_json': history_json,
             'quality_history_json': quality_history_json,
+            'metric_history_json': metric_history_json,
+            'latest_metrics': latest_metric_history_metrics(metric_history),
+            'elapsed_seconds_per_image': (
+                metric_history['elapsed_seconds_per_image'][-1]
+                if metric_history.get('elapsed_seconds_per_image') else avg_elapsed
+            ),
             'generated_images_dir': generated_images_dir,
             'generated_images_zip': generated_images_zip,
             'updated_at': utc_now_iso(),
@@ -1004,6 +1088,12 @@ def main():
             'eta_seconds': eta_seconds,
             'history_json': history_json,
             'quality_history_json': quality_history_json,
+            'metric_history_json': metric_history_json,
+            'latest_metrics': latest_metric_history_metrics(metric_history),
+            'elapsed_seconds_per_image': (
+                metric_history['elapsed_seconds_per_image'][-1]
+                if metric_history.get('elapsed_seconds_per_image') else avg_elapsed
+            ),
             'generated_images_dir': generated_images_dir,
             'generated_images_zip': generated_images_zip,
             'updated_at': utc_now_iso(),
@@ -1077,6 +1167,7 @@ def main():
   write_image_zip(generated_image_records, generated_images_zip)
   write_json(history_json, {'run': run_summary, 'images': history_records})
   write_json(quality_history_json, {'run': run_summary, 'images': quality_history_records})
+  write_json(metric_history_json, metric_history)
   write_json(progress_json, {
       'run': run_summary,
       'status': 'completed',
@@ -1088,6 +1179,12 @@ def main():
       'eta_seconds': eta_seconds,
       'history_json': history_json,
       'quality_history_json': quality_history_json,
+      'metric_history_json': metric_history_json,
+      'latest_metrics': latest_metric_history_metrics(metric_history),
+      'elapsed_seconds_per_image': (
+          metric_history['elapsed_seconds_per_image'][-1]
+          if metric_history.get('elapsed_seconds_per_image') else avg_elapsed
+      ),
       'generated_images_dir': generated_images_dir,
       'generated_images_zip': generated_images_zip,
       'updated_at': utc_now_iso(),
