@@ -549,14 +549,18 @@ def main():
   img_size = purification_config['others']['img_size']
   dataset_name = purification_config['dataset']['name']
   noise_std = measure_config['noise']['sigma']
+  image_resolution = int(img_size[-1])
 
   # Build dataset
   data_config = dict(purification_config['dataset'])
   if args.dataset_root is not None:
       data_config['root'] = args.dataset_root
   transform = transforms.Compose([transforms.ToTensor(),
+                                  transforms.Resize(image_resolution),
+                                  transforms.CenterCrop(image_resolution),
                                   transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
   dataset = get_dataset(**data_config, transforms=transform)
+  logger.info(f"Dataset preprocessing: Resize({image_resolution}) + CenterCrop({image_resolution}) + Normalize([-1,1]).")
 
 
   inverse_problem_type = measure_config['operator']['name']
@@ -634,6 +638,11 @@ def main():
       'inverse_problem_type': inverse_problem_type,
       'dataset_name': dataset_name,
       'dataset_root': data_config.get('root'),
+      'image_preprocessing': {
+          'resize': image_resolution,
+          'center_crop': image_resolution,
+          'normalization': 'minus_one_one',
+      },
       'dataset_count': dataset_count,
       'start_idx': args.start_idx,
       'max_images': args.max_images,
