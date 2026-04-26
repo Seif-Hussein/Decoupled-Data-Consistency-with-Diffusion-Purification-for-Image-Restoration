@@ -14,6 +14,7 @@ import matplotlib.pyplot as plt
 from  torch.cuda.amp import autocast
 import numpy as np
 from PIL import Image
+from torch.utils.data import Subset
 
 from guided_diffusion.condition_methods import get_conditioning_method
 from guided_diffusion.measurements import get_noise, get_operator
@@ -124,6 +125,16 @@ def elapsed_summary(records, target_images):
   if avg_elapsed is not None and target_images is not None:
     eta_seconds = max(target_images - completed, 0) * avg_elapsed
   return avg_elapsed, eta_seconds
+
+def batch_independent_loss(pred, target, loss_type):
+  reduce_dims = tuple(range(1, pred.ndim))
+  if loss_type == 'L2':
+    per_sample = (pred - target).pow(2).mean(dim=reduce_dims)
+  elif loss_type == 'L1':
+    per_sample = (pred - target).abs().mean(dim=reduce_dims)
+  else:
+    raise ValueError(f"Unsupported loss type '{loss_type}'.")
+  return per_sample.sum()
 
 def _as_pair(value, default):
   if value is None:
@@ -247,10 +258,6 @@ def CSGM_Solver_Pixel_Space(measurements, x_init, num_iterations, device, operat
   elif optimizer == 'SGD':
     # Momentum accelerates the reconstruction speed, which ususally leads to better results (0.9)
     optimizer = torch.optim.SGD([x],lr=lr,momentum=momentum)
-  if type == 'L2':
-    criterion = torch.nn.MSELoss().to(device)
-  elif type == 'L1':
-    criterion = torch.nn.L1Loss().to(device)
   x_list = []
 
   measurements = measurements.clone().detach()
@@ -259,11 +266,11 @@ def CSGM_Solver_Pixel_Space(measurements, x_init, num_iterations, device, operat
     optimizer.zero_grad()
     recon = x
     if mask != None:
-      recon_loss = criterion(measurements, operator.forward(recon,mask=mask))
+      recon_loss = batch_independent_loss(operator.forward(recon, mask=mask), measurements, type)
     else:
-      recon_loss = criterion(measurements, operator.forward(recon))
+      recon_loss = batch_independent_loss(operator.forward(recon), measurements, type)
     if use_weight_decay == True:
-      weight_decay_loss = criterion(x, x_init)
+      weight_decay_loss = batch_independent_loss(x, x_init, type)
       recon_loss = recon_loss + weight_decay_lambda*weight_decay_loss
     recon = normalize_image(recon)
     recon_loss.backward()
@@ -284,7 +291,8 @@ def Diffusion_Purified_CSGM(model, img_gt, total_num_iterations, csgm_num_iterat
                             use_weight_decay=False, weight_decay_lambda=0, mask=None, full_ddim = True, 
                             ddim_num_iterations=20, purification_schedule='linear', optimizer='Adam', 
                             momentum=0, lr=0.1, save_every_main=50, save_every_sub=1, 
-                            verbose=False, root_path=None, save_measurements=True):
+                            verbose=False, root_path=None, save_measurements=True,
+                            record_reconstructions=True):
     '''
     model: The pretrained diffusion model
     img_gt: ground truth image
@@ -386,14 +394,16 @@ def Diffusion_Purified_CSGM(model, img_gt, total_num_iterations, csgm_num_iterat
         elif full_ddim == False:
             sample_fn = partial(base_diffusion.p_sample, model=model)
             with autocast():
-              out = sample_fn(x=x_noisy, t=torch.tensor(int(ddim_timestep-1)).unsqueeze(0).to(device))
+              t_batch = torch.full((x_noisy.shape[0],), int(ddim_timestep-1), device=device, dtype=torch.long)
+              out = sample_fn(x=x_noisy, t=t_batch)
               x_purified = out['pred_xstart']
               x_purified = x_purified.detach()
 
         x_prev = x.clone().detach()
         x = x_purified
-        x_list_complete = x_list_complete + x_list_sub
-        x_list_complete.append(x)
+        if record_reconstructions:
+            x_list_complete = x_list_complete + x_list_sub
+            x_list_complete.append(x)
 
         if i % save_every_main == 0 or i==total_num_iterations-1:
             if verbose == True:
@@ -428,6 +438,8 @@ def main():
                       help='Maximum number of images to process. Use -1 for all images.')
   parser.add_argument('--start_idx', type=int, default=0,
                       help='Dataset index to start from before applying max_images.')
+  parser.add_argument('--batch_size', type=int, default=1,
+                      help='Images per solver batch. Values >1 are supported only for Tweedie mode with skipped metrics.')
   parser.add_argument('--seed', type=int, default=None,
                       help='Random seed for masks, measurement noise, and initialization.')
   parser.add_argument('--full_ddim_override', choices=['config', 'true', 'false'], default='config',
@@ -440,6 +452,8 @@ def main():
                       help='Save measurement preview figures.')
   parser.add_argument('--save_progress_figures', action='store_true',
                       help='Save per-iteration progress figures.')
+  parser.add_argument('--save_recon_history', action='store_true',
+                      help='Save x_list_complete.pt and retain intermediate reconstructions when metrics are skipped.')
   args = parser.parse_args()
 
   # logger
@@ -514,7 +528,6 @@ def main():
   transform = transforms.Compose([transforms.ToTensor(),
                                   transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
   dataset = get_dataset(**data_config, transforms=transform)
-  loader = get_dataloader(dataset, batch_size=1, num_workers=0, train=False)
 
 
   inverse_problem_type = measure_config['operator']['name']
@@ -564,6 +577,19 @@ def main():
   else:
       available_images = max(dataset_count - args.start_idx, 0)
       target_images = available_images if args.max_images < 0 else min(args.max_images, available_images)
+  if args.batch_size < 1:
+      raise ValueError("--batch_size must be >= 1.")
+  if args.batch_size > 1 and full_ddim:
+      raise ValueError("--batch_size > 1 is currently supported only with Tweedie mode/full_ddim=False.")
+  if args.batch_size > 1 and not args.skip_metrics:
+      raise ValueError("--batch_size > 1 requires --skip_metrics because metric history is per-image.")
+  if dataset_count is None or target_images is None:
+      selected_indices = None
+      loader = get_dataloader(dataset, batch_size=args.batch_size, num_workers=0, train=False)
+  else:
+      selected_indices = list(range(args.start_idx, args.start_idx + target_images))
+      run_dataset = Subset(dataset, selected_indices)
+      loader = get_dataloader(run_dataset, batch_size=args.batch_size, num_workers=0, train=False)
 
   progress_json = os.path.join(out_path, 'progress.json')
   history_json = os.path.join(out_path, 'history.json')
@@ -583,12 +609,14 @@ def main():
       'start_idx': args.start_idx,
       'max_images': args.max_images,
       'target_images': target_images,
+      'batch_size': args.batch_size,
       'seed': args.seed,
       'mode': 'ddim' if full_ddim else 'tweedie',
       'noise_std': noise_std,
       'skip_metrics': args.skip_metrics,
       'save_measurements': args.save_measurements,
       'save_progress_figures': args.save_progress_figures,
+      'save_recon_history': args.save_recon_history,
       'output_dir': out_path,
       'run_output_dir': path_0,
       'generated_images_dir': generated_images_dir,
@@ -628,16 +656,30 @@ def main():
   })
 
   processed_images = 0
-  for i, img in enumerate(loader):
-      if i < args.start_idx:
-         continue
-      if args.max_images >= 0 and processed_images >= args.max_images:
-         break
-      processed_images += 1
+  for batch_number, img in enumerate(loader):
+      batch_count = int(img.shape[0])
+      if selected_indices is None:
+          batch_indices = list(range(args.start_idx + processed_images, args.start_idx + processed_images + batch_count))
+      else:
+          batch_indices = selected_indices[processed_images:processed_images + batch_count]
+      if not batch_indices:
+          break
+      batch_first_idx = batch_indices[0]
+      batch_last_idx = batch_indices[-1]
+      batch_image_paths = []
+      for dataset_index in batch_indices:
+          image_path = None
+          if hasattr(dataset, 'fpaths') and dataset_index < len(dataset.fpaths):
+              image_path = dataset.fpaths[dataset_index]
+          batch_image_paths.append(image_path)
+      processed_images += batch_count
       image_started_at = utc_now_iso()
       image_start_time = time.perf_counter()
       img = img.to(device)
-      root_path = path_0 + '/img_' + str(i) + '/'
+      if batch_count == 1:
+          root_path = path_0 + '/img_' + str(batch_first_idx) + '/'
+      else:
+          root_path = path_0 + '/batch_' + str(batch_first_idx) + '_' + str(batch_last_idx) + '/'
       isExist = os.path.exists(root_path)
       if not isExist:
           os.makedirs(root_path)
@@ -648,17 +690,17 @@ def main():
           os.makedirs(figure_root_path)        
       if mask is not None:
           torch.save(mask.detach().cpu(), root_path + 'mask.pt')
-      image_path = None
-      if hasattr(dataset, 'fpaths') and i < len(dataset.fpaths):
-          image_path = dataset.fpaths[i]
       avg_elapsed, eta_seconds = elapsed_summary(history_records, target_images)
       write_json(progress_json, {
           'run': run_summary,
           'status': 'running',
-          'completed_images': processed_images - 1,
-          'current_image_index': i,
-          'current_processed_image': processed_images,
-          'current_image_path': image_path,
+          'completed_images': processed_images - batch_count,
+          'current_image_index': batch_first_idx,
+          'current_image_indices': batch_indices,
+          'current_processed_image': processed_images - batch_count + 1,
+          'current_processed_images': list(range(processed_images - batch_count + 1, processed_images + 1)),
+          'current_image_path': batch_image_paths[0],
+          'current_image_paths': batch_image_paths,
           'avg_elapsed_seconds_per_image': avg_elapsed,
           'eta_seconds': eta_seconds,
           'history_json': history_json,
@@ -680,21 +722,29 @@ def main():
                                                       momentum=momentum, lr=lr, save_every_main=save_every_main,
                                                       save_every_sub=save_every_sub, verbose=args.save_progress_figures,
                                                       root_path=figure_root_path,
-                                                      save_measurements=args.save_measurements)
+                                                      save_measurements=args.save_measurements,
+                                                      record_reconstructions=(args.save_recon_history or not args.skip_metrics))
         solver_elapsed_seconds = time.perf_counter() - solver_start_time
       
         # Save the intermediate reconstructions
-        torch.save(x_list_complete,root_path+'x_list_complete.pt')
-        image_stem = os.path.splitext(os.path.basename(image_path or f'img_{i:05d}.png'))[0]
-        generated_image_name = f'{i:05d}_{image_stem}.png'
-        generated_image_path = os.path.join(generated_images_dir, generated_image_name)
-        save_tensor_image(x, generated_image_path)
-        generated_image_record = {
-            'dataset_index': i,
-            'path': generated_image_path,
-            'arcname': generated_image_name,
-        }
-        generated_image_records.append(generated_image_record)
+        saved_recon_history = False
+        if args.save_recon_history:
+          torch.save(x_list_complete,root_path+'x_list_complete.pt')
+          saved_recon_history = True
+        batch_generated = []
+        for sample_offset, dataset_index in enumerate(batch_indices):
+          sample_image_path = batch_image_paths[sample_offset]
+          image_stem = os.path.splitext(os.path.basename(sample_image_path or f'img_{dataset_index:05d}.png'))[0]
+          generated_image_name = f'{dataset_index:05d}_{image_stem}.png'
+          generated_image_path = os.path.join(generated_images_dir, generated_image_name)
+          save_tensor_image(x[sample_offset:sample_offset + 1], generated_image_path)
+          generated_image_record = {
+              'dataset_index': dataset_index,
+              'path': generated_image_path,
+              'arcname': generated_image_name,
+          }
+          batch_generated.append(generated_image_record)
+          generated_image_records.append(generated_image_record)
         write_image_zip(generated_image_records, generated_images_zip)
 
         metrics_start_time = time.perf_counter()
@@ -772,23 +822,35 @@ def main():
             torch.save(LPIPS_list, root_path+'/LPIPS_list.pt')
             LPIPS_list_All.append(LPIPS_list)
         metrics_elapsed_seconds = time.perf_counter() - metrics_start_time
-        image_elapsed_seconds = time.perf_counter() - image_start_time
-        image_record = {
-            'dataset_index': i,
-            'processed_image': processed_images,
-            'image_path': image_path,
-            'output_dir': root_path,
-            'started_at': image_started_at,
-            'ended_at': utc_now_iso(),
-            'elapsed_seconds': image_elapsed_seconds,
-            'solver_elapsed_seconds': solver_elapsed_seconds,
-            'metrics_elapsed_seconds': metrics_elapsed_seconds,
-            'num_saved_reconstructions': len(x_list_complete),
-            'generated_image': generated_image_path,
-            'generated_image_zip_member': generated_image_name,
-            'metrics': final_metrics,
-        }
-        history_records.append(image_record)
+        batch_elapsed_seconds = time.perf_counter() - image_start_time
+        ended_at = utc_now_iso()
+        new_image_records = []
+        for sample_offset, dataset_index in enumerate(batch_indices):
+          generated = batch_generated[sample_offset]
+          image_record = {
+              'dataset_index': dataset_index,
+              'processed_image': processed_images - batch_count + sample_offset + 1,
+              'image_path': batch_image_paths[sample_offset],
+              'output_dir': root_path,
+              'started_at': image_started_at,
+              'ended_at': ended_at,
+              'elapsed_seconds': batch_elapsed_seconds / batch_count,
+              'batch_elapsed_seconds': batch_elapsed_seconds,
+              'solver_elapsed_seconds': solver_elapsed_seconds / batch_count,
+              'batch_solver_elapsed_seconds': solver_elapsed_seconds,
+              'metrics_elapsed_seconds': metrics_elapsed_seconds / batch_count,
+              'batch_metrics_elapsed_seconds': metrics_elapsed_seconds,
+              'batch_size': batch_count,
+              'batch_number': batch_number,
+              'batch_dataset_indices': batch_indices,
+              'num_recorded_reconstructions': len(x_list_complete),
+              'num_saved_reconstructions': len(x_list_complete) if saved_recon_history else 0,
+              'generated_image': generated['path'],
+              'generated_image_zip_member': generated['arcname'],
+              'metrics': final_metrics if batch_count == 1 else {},
+          }
+          new_image_records.append(image_record)
+        history_records.extend(new_image_records)
         write_json(history_json, {'run': run_summary, 'images': history_records})
         avg_elapsed, eta_seconds = elapsed_summary(history_records, target_images)
         write_json(progress_json, {
@@ -797,7 +859,7 @@ def main():
             'completed_images': processed_images,
             'current_image_index': None,
             'current_image_path': None,
-            'last_image': image_record,
+            'last_image': new_image_records[-1],
             'avg_elapsed_seconds_per_image': avg_elapsed,
             'eta_seconds': eta_seconds,
             'history_json': history_json,
@@ -811,10 +873,13 @@ def main():
         write_json(progress_json, {
             'run': run_summary,
             'status': 'failed',
-            'completed_images': processed_images - 1,
-            'current_image_index': i,
-            'current_processed_image': processed_images,
-            'current_image_path': image_path,
+            'completed_images': processed_images - batch_count,
+            'current_image_index': batch_first_idx,
+            'current_image_indices': batch_indices,
+            'current_processed_image': processed_images - batch_count + 1,
+            'current_processed_images': list(range(processed_images - batch_count + 1, processed_images + 1)),
+            'current_image_path': batch_image_paths[0],
+            'current_image_paths': batch_image_paths,
             'error': repr(exc),
             'avg_elapsed_seconds_per_image': avg_elapsed,
             'eta_seconds': eta_seconds,
