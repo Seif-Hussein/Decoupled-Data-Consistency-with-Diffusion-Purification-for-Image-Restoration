@@ -77,6 +77,7 @@ def main() -> int:
     parser.add_argument("--save-measurements", action="store_true")
     parser.add_argument("--save-progress-figures", action="store_true")
     parser.add_argument("--save-recon-history", action="store_true")
+    parser.add_argument("--save-metric-history", action="store_true")
     parser.add_argument("--save-quality-history", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -128,6 +129,8 @@ def main() -> int:
             cmd.append("--save_progress_figures")
         if args.save_recon_history:
             cmd.append("--save_recon_history")
+        if args.save_metric_history:
+            cmd.append("--save_metric_history")
         if args.save_quality_history:
             cmd.append("--save_quality_history")
         output_name = task["output_name"]

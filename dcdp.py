@@ -180,6 +180,106 @@ def compute_quality_history_records(gt_batch, recon_batches, trace_records, lpip
       records_by_sample[sample_idx].append(record)
   return records_by_sample
 
+def compute_average_quality_metrics(gt_batch, recon_batch, lpips_metric, device):
+  if peak_signal_noise_ratio is None or compare_ssim is None:
+    return {}
+  psnr_values = []
+  ssim_values = []
+  for sample_idx in range(gt_batch.shape[0]):
+    gt_np = gt_batch[sample_idx].detach().cpu().permute(1, 2, 0).numpy()
+    gt_np = np.clip(gt_np, -1, 1)
+    gt_np = (gt_np + 1) / 2
+
+    recon_np = recon_batch[sample_idx].detach().cpu().permute(1, 2, 0).numpy()
+    recon_np = np.clip(recon_np, -1, 1)
+    recon_np = (recon_np + 1) / 2
+
+    psnr_values.append(float(peak_signal_noise_ratio(gt_np, recon_np)))
+    ssim_values.append(float(compare_ssim(gt_np, recon_np, channel_axis=2, data_range=1,
+                                          gaussian_weights=True, sigma=1.5,
+                                          use_sample_covariance=False)))
+  metrics = {
+      'psnr': float(sum(psnr_values) / len(psnr_values)),
+      'ssim': float(sum(ssim_values) / len(ssim_values)),
+  }
+  if lpips_metric is not None:
+    lpips_value = get_lpips(gt_batch, recon_batch, lpips=lpips_metric, device=device)
+    metrics['lpips'] = float(np.asarray(lpips_value).reshape(-1)[0])
+  return metrics
+
+def empty_metric_history():
+  return {
+      'step': [],
+      'stage': [],
+      'main_iteration': [],
+      'sub_iteration': [],
+      'ddim_timestep': [],
+      'elapsed_seconds_per_image': [],
+      'x_k_psnr': [],
+      'x_k_ssim': [],
+      'x_k_lpips': [],
+      'z_k_psnr': [],
+      'z_k_ssim': [],
+      'z_k_lpips': [],
+  }
+
+def compute_metric_history_records(gt_batch, recon_batches, trace_records, lpips_metric, device):
+  batch_size = max(int(gt_batch.shape[0]), 1)
+  metric_history = empty_metric_history()
+  for checkpoint_idx, recon_batch in enumerate(recon_batches):
+    trace = trace_records[checkpoint_idx] if checkpoint_idx < len(trace_records) else {}
+    metrics = compute_average_quality_metrics(gt_batch, recon_batch, lpips_metric, device)
+    metric_history['step'].append(checkpoint_idx + 1)
+    metric_history['stage'].append(trace.get('stage'))
+    metric_history['main_iteration'].append(trace.get('main_iteration'))
+    metric_history['sub_iteration'].append(trace.get('sub_iteration'))
+    metric_history['ddim_timestep'].append(trace.get('ddim_timestep'))
+    elapsed_seconds = trace.get('elapsed_seconds')
+    metric_history['elapsed_seconds_per_image'].append(
+        float(elapsed_seconds) / batch_size if isinstance(elapsed_seconds, (int, float)) else None
+    )
+    for metric_name in ['psnr', 'ssim', 'lpips']:
+      value = metrics.get(metric_name)
+      metric_history[f'x_k_{metric_name}'].append(value)
+      # The PDHG table notebook chooses x_k for PDHG and z_k otherwise.
+      # DCDP has one reconstruction stream, so expose both names identically.
+      metric_history[f'z_k_{metric_name}'].append(value)
+  return metric_history
+
+def combine_metric_history_batches(batch_histories):
+  if not batch_histories:
+    return empty_metric_history()
+  metric_history = empty_metric_history()
+  max_len = max(len(batch['history'].get('step', [])) for batch in batch_histories)
+  average_keys = [
+      'elapsed_seconds_per_image',
+      'x_k_psnr', 'x_k_ssim', 'x_k_lpips',
+      'z_k_psnr', 'z_k_ssim', 'z_k_lpips',
+  ]
+  trace_keys = ['step', 'stage', 'main_iteration', 'sub_iteration', 'ddim_timestep']
+  for idx in range(max_len):
+    reference = None
+    for batch in batch_histories:
+      history = batch['history']
+      if idx < len(history.get('step', [])):
+        reference = history
+        break
+    for key in trace_keys:
+      metric_history[key].append(reference[key][idx] if reference is not None and idx < len(reference.get(key, [])) else None)
+    for key in average_keys:
+      weighted_sum = 0.0
+      total_weight = 0.0
+      for batch in batch_histories:
+        history = batch['history']
+        values = history.get(key, [])
+        if idx >= len(values) or values[idx] is None:
+          continue
+        weight = max(float(batch.get('batch_size', 1) or 1), 1.0)
+        weighted_sum += float(values[idx]) * weight
+        total_weight += weight
+      metric_history[key].append(float(weighted_sum / total_weight) if total_weight > 0 else None)
+  return metric_history
+
 def build_metric_history_from_quality_records(quality_records):
   buckets = {}
   for image_record in quality_records:
@@ -589,8 +689,10 @@ def main():
                       help='Save per-iteration progress figures.')
   parser.add_argument('--save_recon_history', action='store_true',
                       help='Save x_list_complete.pt and retain intermediate reconstructions when metrics are skipped.')
+  parser.add_argument('--save_metric_history', action='store_true',
+                      help='Write PDHG-style aggregate metric_history.json with anytime PSNR/SSIM/LPIPS curves.')
   parser.add_argument('--save_quality_history', action='store_true',
-                      help='Write quality_history.json with PSNR/SSIM/LPIPS versus elapsed solver time at reconstruction checkpoints.')
+                      help='Write detailed per-image quality_history.json with PSNR/SSIM/LPIPS at reconstruction checkpoints. This is much slower than --save_metric_history.')
   args = parser.parse_args()
 
   # logger
@@ -766,6 +868,7 @@ def main():
       'save_measurements': args.save_measurements,
       'save_progress_figures': args.save_progress_figures,
       'save_recon_history': args.save_recon_history,
+      'save_metric_history': args.save_metric_history,
       'save_quality_history': args.save_quality_history,
       'output_dir': out_path,
       'run_output_dir': path_0,
@@ -799,7 +902,8 @@ def main():
   }
   history_records = []
   quality_history_records = []
-  metric_history = build_metric_history_from_quality_records(quality_history_records)
+  metric_history_batches = []
+  metric_history = combine_metric_history_batches(metric_history_batches)
   generated_image_records = []
   write_image_zip(generated_image_records, generated_images_zip)
   write_json(history_json, {'run': run_summary, 'images': history_records})
@@ -893,7 +997,7 @@ def main():
                                                       save_every_sub=save_every_sub, verbose=args.save_progress_figures,
                                                       root_path=figure_root_path,
                                                       save_measurements=args.save_measurements,
-                                                      record_reconstructions=(args.save_recon_history or args.save_quality_history or not args.skip_metrics))
+                                                      record_reconstructions=(args.save_recon_history or args.save_metric_history or args.save_quality_history or not args.skip_metrics))
         solver_elapsed_seconds = time.perf_counter() - solver_start_time
       
         # Save the intermediate reconstructions
@@ -924,6 +1028,9 @@ def main():
         batch_quality_history = [[] for _ in batch_indices]
         if args.save_quality_history:
           batch_quality_history = compute_quality_history_records(img, x_list_complete, x_trace_complete, lpips, device)
+        batch_metric_history = None
+        if args.save_metric_history or args.save_quality_history:
+          batch_metric_history = compute_metric_history_records(img, x_list_complete, x_trace_complete, lpips, device)
         final_metrics = {}
         PSNR_list = []
         SSIM_list = []
@@ -1044,7 +1151,9 @@ def main():
           new_image_records.append(image_record)
         history_records.extend(new_image_records)
         quality_history_records.extend(new_quality_history_records)
-        metric_history = build_metric_history_from_quality_records(quality_history_records)
+        if batch_metric_history is not None:
+          metric_history_batches.append({'batch_size': batch_count, 'history': batch_metric_history})
+        metric_history = combine_metric_history_batches(metric_history_batches)
         write_json(history_json, {'run': run_summary, 'images': history_records})
         write_json(quality_history_json, {'run': run_summary, 'images': quality_history_records})
         write_json(metric_history_json, metric_history)
