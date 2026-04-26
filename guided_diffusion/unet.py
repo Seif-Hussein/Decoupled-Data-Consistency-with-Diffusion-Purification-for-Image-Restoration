@@ -84,10 +84,15 @@ def create_model(
         use_new_attention_order=use_new_attention_order,
     )
 
+    if not model_path:
+        raise RuntimeError("model_path is empty; DCDP runs require a pretrained diffusion checkpoint.")
     try:
         model.load_state_dict(th.load(model_path, map_location='cpu'))
     except Exception as e:
-        print(f"Got exception: {e} / Randomly initialize")
+        raise RuntimeError(
+            f"Failed to load pretrained diffusion checkpoint from {model_path!r}. "
+            "Check that models/ffhq_10m.pt exists and is a valid PyTorch checkpoint."
+        ) from e
     return model
 
 class AttentionPool2d(nn.Module):
