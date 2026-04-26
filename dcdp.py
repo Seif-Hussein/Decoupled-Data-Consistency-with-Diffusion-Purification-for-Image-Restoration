@@ -466,7 +466,7 @@ def main():
   parser.add_argument('--start_idx', type=int, default=0,
                       help='Dataset index to start from before applying max_images.')
   parser.add_argument('--batch_size', type=int, default=1,
-                      help='Images per solver batch. Values >1 are supported only for Tweedie mode with skipped metrics.')
+                      help='Images per solver batch. Values >1 require skipped intermediate metric sweeps.')
   parser.add_argument('--seed', type=int, default=None,
                       help='Random seed for masks, measurement noise, and initialization.')
   parser.add_argument('--full_ddim_override', choices=['config', 'true', 'false'], default='config',
@@ -612,8 +612,6 @@ def main():
       target_images = available_images if args.max_images < 0 else min(args.max_images, available_images)
   if args.batch_size < 1:
       raise ValueError("--batch_size must be >= 1.")
-  if args.batch_size > 1 and full_ddim:
-      raise ValueError("--batch_size > 1 is currently supported only with Tweedie mode/full_ddim=False.")
   if args.batch_size > 1 and not args.skip_metrics:
       raise ValueError("--batch_size > 1 requires --skip_metrics because metric history is per-image.")
   if dataset_count is None or target_images is None:
