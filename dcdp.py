@@ -6,12 +6,14 @@ import json
 import random
 import time
 import yaml
+import zipfile
 
 import torch
 import torchvision.transforms as transforms
 import matplotlib.pyplot as plt
 from  torch.cuda.amp import autocast
 import numpy as np
+from PIL import Image
 
 from guided_diffusion.condition_methods import get_conditioning_method
 from guided_diffusion.measurements import get_noise, get_operator
@@ -89,6 +91,30 @@ def write_json(path, payload):
   with open(tmp_path, 'w', encoding='utf-8') as f:
     json.dump(payload, f, indent=2, sort_keys=True, default=_json_default)
   os.replace(tmp_path, path)
+
+def save_tensor_image(img_torch, path):
+  os.makedirs(os.path.dirname(path), exist_ok=True)
+  img = img_torch.detach().cpu()
+  if img.ndim == 4:
+    img = img[0]
+  img = img.clamp(-1, 1)
+  img = ((img + 1.0) * 127.5).round().to(torch.uint8)
+  if img.shape[0] == 1:
+    img_np = img[0].numpy()
+  else:
+    img_np = img.permute(1, 2, 0).numpy()
+  Image.fromarray(img_np).save(path)
+
+def write_image_zip(image_records, zip_path):
+  os.makedirs(os.path.dirname(zip_path), exist_ok=True)
+  tmp_path = zip_path + '.tmp'
+  with zipfile.ZipFile(tmp_path, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
+    for record in image_records:
+      image_path = record.get('path')
+      arcname = record.get('arcname') or os.path.basename(image_path)
+      if image_path and os.path.exists(image_path):
+        zf.write(image_path, arcname=arcname)
+  os.replace(tmp_path, zip_path)
 
 def elapsed_summary(records, target_images):
   completed = len(records)
@@ -541,6 +567,9 @@ def main():
 
   progress_json = os.path.join(out_path, 'progress.json')
   history_json = os.path.join(out_path, 'history.json')
+  generated_images_dir = os.path.join(out_path, 'generated_images')
+  generated_images_zip = os.path.join(out_path, 'generated_images.zip')
+  os.makedirs(generated_images_dir, exist_ok=True)
   run_started_at = utc_now_iso()
   run_start_time = time.perf_counter()
   run_id = run_started_at.replace(':', '').replace('+', 'Z') + '_' + task_name
@@ -562,6 +591,8 @@ def main():
       'save_progress_figures': args.save_progress_figures,
       'output_dir': out_path,
       'run_output_dir': path_0,
+      'generated_images_dir': generated_images_dir,
+      'generated_images_zip': generated_images_zip,
       'started_at': run_started_at,
       'hyperparameters': {
           'total_num_iterations': total_num_iterations,
@@ -579,6 +610,8 @@ def main():
       },
   }
   history_records = []
+  generated_image_records = []
+  write_image_zip(generated_image_records, generated_images_zip)
   write_json(history_json, {'run': run_summary, 'images': history_records})
   write_json(progress_json, {
       'run': run_summary,
@@ -589,6 +622,8 @@ def main():
       'avg_elapsed_seconds_per_image': None,
       'eta_seconds': None,
       'history_json': history_json,
+      'generated_images_dir': generated_images_dir,
+      'generated_images_zip': generated_images_zip,
       'updated_at': utc_now_iso(),
   })
 
@@ -627,6 +662,8 @@ def main():
           'avg_elapsed_seconds_per_image': avg_elapsed,
           'eta_seconds': eta_seconds,
           'history_json': history_json,
+          'generated_images_dir': generated_images_dir,
+          'generated_images_zip': generated_images_zip,
           'updated_at': utc_now_iso(),
       })
 
@@ -648,6 +685,17 @@ def main():
       
         # Save the intermediate reconstructions
         torch.save(x_list_complete,root_path+'x_list_complete.pt')
+        image_stem = os.path.splitext(os.path.basename(image_path or f'img_{i:05d}.png'))[0]
+        generated_image_name = f'{i:05d}_{image_stem}.png'
+        generated_image_path = os.path.join(generated_images_dir, generated_image_name)
+        save_tensor_image(x, generated_image_path)
+        generated_image_record = {
+            'dataset_index': i,
+            'path': generated_image_path,
+            'arcname': generated_image_name,
+        }
+        generated_image_records.append(generated_image_record)
+        write_image_zip(generated_image_records, generated_images_zip)
 
         metrics_start_time = time.perf_counter()
         final_metrics = {}
@@ -736,6 +784,8 @@ def main():
             'solver_elapsed_seconds': solver_elapsed_seconds,
             'metrics_elapsed_seconds': metrics_elapsed_seconds,
             'num_saved_reconstructions': len(x_list_complete),
+            'generated_image': generated_image_path,
+            'generated_image_zip_member': generated_image_name,
             'metrics': final_metrics,
         }
         history_records.append(image_record)
@@ -751,9 +801,12 @@ def main():
             'avg_elapsed_seconds_per_image': avg_elapsed,
             'eta_seconds': eta_seconds,
             'history_json': history_json,
+            'generated_images_dir': generated_images_dir,
+            'generated_images_zip': generated_images_zip,
             'updated_at': utc_now_iso(),
         })
       except Exception as exc:
+        write_image_zip(generated_image_records, generated_images_zip)
         avg_elapsed, eta_seconds = elapsed_summary(history_records, target_images)
         write_json(progress_json, {
             'run': run_summary,
@@ -766,6 +819,8 @@ def main():
             'avg_elapsed_seconds_per_image': avg_elapsed,
             'eta_seconds': eta_seconds,
             'history_json': history_json,
+            'generated_images_dir': generated_images_dir,
+            'generated_images_zip': generated_images_zip,
             'updated_at': utc_now_iso(),
         })
         raise
@@ -834,6 +889,7 @@ def main():
   run_summary['ended_at'] = utc_now_iso()
   run_summary['run_elapsed_seconds'] = time.perf_counter() - run_start_time
   run_summary['completed_images'] = processed_images
+  write_image_zip(generated_image_records, generated_images_zip)
   write_json(history_json, {'run': run_summary, 'images': history_records})
   write_json(progress_json, {
       'run': run_summary,
@@ -845,6 +901,8 @@ def main():
       'avg_elapsed_seconds_per_image': avg_elapsed,
       'eta_seconds': eta_seconds,
       'history_json': history_json,
+      'generated_images_dir': generated_images_dir,
+      'generated_images_zip': generated_images_zip,
       'updated_at': utc_now_iso(),
   })
 

@@ -115,6 +115,7 @@ def main() -> int:
         print(f"\n=== {task_name} ({task['source']} preset) ===")
         print(f"Progress JSON: {args.save_dir / task_name / 'progress.json'}")
         print(f"History JSON: {args.save_dir / task_name / 'history.json'}")
+        print(f"Generated images zip: {args.save_dir / task_name / 'generated_images.zip'}")
         print(" ".join(cmd))
         if not args.dry_run:
             subprocess.run(cmd, cwd=repo_root, check=True)
