@@ -73,6 +73,7 @@ def main() -> int:
     parser.add_argument("--mode", choices=["ddim", "tweedie"], default="ddim")
     parser.add_argument("--ddim-steps", type=int, default=None)
     parser.add_argument("--skip-metrics", action="store_true")
+    parser.add_argument("--final-metrics", action="store_true")
     parser.add_argument("--save-measurements", action="store_true")
     parser.add_argument("--save-progress-figures", action="store_true")
     parser.add_argument("--save-recon-history", action="store_true")
@@ -118,6 +119,8 @@ def main() -> int:
             cmd.extend(["--ddim_num_iterations_override", str(args.ddim_steps)])
         if args.skip_metrics:
             cmd.append("--skip_metrics")
+        if args.final_metrics:
+            cmd.append("--final_metrics")
         if args.save_measurements:
             cmd.append("--save_measurements")
         if args.save_progress_figures:

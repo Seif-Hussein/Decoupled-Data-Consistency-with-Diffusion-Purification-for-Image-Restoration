@@ -136,6 +136,33 @@ def batch_independent_loss(pred, target, loss_type):
     raise ValueError(f"Unsupported loss type '{loss_type}'.")
   return per_sample.sum()
 
+def compute_final_quality_metrics(gt_batch, recon_batch, lpips_metric, device):
+  metrics = []
+  if peak_signal_noise_ratio is None or compare_ssim is None:
+    return [{} for _ in range(gt_batch.shape[0])]
+  for sample_idx in range(gt_batch.shape[0]):
+    gt_np = gt_batch[sample_idx].detach().cpu().permute(1, 2, 0).numpy()
+    gt_np = np.clip(gt_np, -1, 1)
+    gt_np = (gt_np + 1) / 2
+
+    recon_np = recon_batch[sample_idx].detach().cpu().permute(1, 2, 0).numpy()
+    recon_np = np.clip(recon_np, -1, 1)
+    recon_np = (recon_np + 1) / 2
+
+    sample_metrics = {
+      'final_psnr': float(peak_signal_noise_ratio(gt_np, recon_np)),
+      'final_ssim': float(compare_ssim(gt_np, recon_np, channel_axis=2, data_range=1,
+                                       gaussian_weights=True, sigma=1.5,
+                                       use_sample_covariance=False)),
+    }
+    if lpips_metric is not None:
+      lpips_value = get_lpips(gt_batch[sample_idx:sample_idx + 1],
+                              recon_batch[sample_idx:sample_idx + 1],
+                              lpips=lpips_metric, device=device)
+      sample_metrics['final_lpips'] = float(np.asarray(lpips_value).reshape(-1)[0])
+    metrics.append(sample_metrics)
+  return metrics
+
 def _as_pair(value, default):
   if value is None:
     value = default
@@ -448,6 +475,8 @@ def main():
                       help='Override purification_config ddim_num_iterations.')
   parser.add_argument('--skip_metrics', action='store_true',
                       help='Skip PSNR/SSIM/LPIPS sweeps over intermediate reconstructions.')
+  parser.add_argument('--final_metrics', action='store_true',
+                      help='Compute final-image PSNR/SSIM/LPIPS without the expensive intermediate metric sweep.')
   parser.add_argument('--save_measurements', action='store_true',
                       help='Save measurement preview figures.')
   parser.add_argument('--save_progress_figures', action='store_true',
@@ -614,6 +643,7 @@ def main():
       'mode': 'ddim' if full_ddim else 'tweedie',
       'noise_std': noise_std,
       'skip_metrics': args.skip_metrics,
+      'final_metrics': args.final_metrics,
       'save_measurements': args.save_measurements,
       'save_progress_figures': args.save_progress_figures,
       'save_recon_history': args.save_recon_history,
@@ -748,6 +778,9 @@ def main():
         write_image_zip(generated_image_records, generated_images_zip)
 
         metrics_start_time = time.perf_counter()
+        final_metrics_by_sample = [{} for _ in batch_indices]
+        if args.final_metrics or not args.skip_metrics:
+          final_metrics_by_sample = compute_final_quality_metrics(img, x, lpips, device)
         final_metrics = {}
         PSNR_list = []
         SSIM_list = []
@@ -809,6 +842,8 @@ def main():
           }
           if len(LPIPS_list) > 0:
               final_metrics['final_lpips'] = float(np.asarray(LPIPS_list[-1]).reshape(-1)[0])
+          if batch_count == 1:
+              final_metrics_by_sample[0] = final_metrics
 
           LPIPS_list = np.array(LPIPS_list)
           PSNR_list = np.array(PSNR_list)
@@ -847,7 +882,7 @@ def main():
               'num_saved_reconstructions': len(x_list_complete) if saved_recon_history else 0,
               'generated_image': generated['path'],
               'generated_image_zip_member': generated['arcname'],
-              'metrics': final_metrics if batch_count == 1 else {},
+              'metrics': final_metrics_by_sample[sample_offset],
           }
           new_image_records.append(image_record)
         history_records.extend(new_image_records)
