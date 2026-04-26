@@ -163,11 +163,14 @@ class NonLinearOperator(ABC):
 
 @register_operator(name='phase_retrieval')
 class PhaseRetrievalOperator(NonLinearOperator):
-    def __init__(self, oversample, device):
-        self.pad = int((oversample / 8.0) * 256)
+    def __init__(self, oversample, device, resolution=256, input_range='minus_one_one'):
+        self.pad = int((oversample / 8.0) * resolution)
         self.device = device
+        self.input_range = input_range
         
     def forward(self, data, **kwargs):
+        if self.input_range in ('zero_one', '0_1', '[0,1]'):
+            data = data * 0.5 + 0.5
         padded = F.pad(data, (self.pad, self.pad, self.pad, self.pad))
         amplitude = fft2_m(padded).abs()
         return amplitude
