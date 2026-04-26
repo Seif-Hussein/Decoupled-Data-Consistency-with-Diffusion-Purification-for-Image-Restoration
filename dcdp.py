@@ -512,7 +512,8 @@ def Diffusion_Purified_CSGM(model, img_gt, total_num_iterations, csgm_num_iterat
                             ddim_num_iterations=20, purification_schedule='linear', optimizer='Adam', 
                             momentum=0, lr=0.1, save_every_main=50, save_every_sub=1, 
                             verbose=False, root_path=None, save_measurements=True,
-                            record_reconstructions=True):
+                            record_reconstructions=True, record_metric_history=False,
+                            metric_lpips=None):
     '''
     model: The pretrained diffusion model
     img_gt: ground truth image
@@ -552,7 +553,29 @@ def Diffusion_Purified_CSGM(model, img_gt, total_num_iterations, csgm_num_iterat
     x = torch.zeros(img_gt.shape, device=device, requires_grad=True)
     x_list_complete = []
     x_trace_complete = []
+    metric_history = empty_metric_history()
     trace_start_time = time.perf_counter()
+
+    def append_metric_checkpoint(recon_batch, trace):
+        if not record_metric_history:
+            return
+        metrics = compute_average_quality_metrics(img_gt, recon_batch, metric_lpips, device)
+        checkpoint_idx = len(metric_history['step'])
+        metric_history['step'].append(checkpoint_idx + 1)
+        metric_history['stage'].append(trace.get('stage'))
+        metric_history['main_iteration'].append(trace.get('main_iteration'))
+        metric_history['sub_iteration'].append(trace.get('sub_iteration'))
+        metric_history['ddim_timestep'].append(trace.get('ddim_timestep'))
+        elapsed_seconds = trace.get('elapsed_seconds')
+        metric_history['elapsed_seconds_per_image'].append(
+            float(elapsed_seconds) / max(int(img_gt.shape[0]), 1)
+            if isinstance(elapsed_seconds, (int, float)) else None
+        )
+        for metric_name in ['psnr', 'ssim', 'lpips']:
+            value = metrics.get(metric_name)
+            metric_history[f'x_k_{metric_name}'].append(value)
+            metric_history[f'z_k_{metric_name}'].append(value)
+
     # Initialize the purification timesteps
     purification_timesteps = Purification_Schedule(total_num_iterations, ddim_init_timestep, ddim_end_timestep, schedule_type=purification_schedule)
 
@@ -626,6 +649,17 @@ def Diffusion_Purified_CSGM(model, img_gt, total_num_iterations, csgm_num_iterat
 
         x_prev = x.clone().detach()
         x = x_purified
+        if record_metric_history:
+            for recon_checkpoint, trace_checkpoint in zip(x_list_sub, x_trace_sub):
+                append_metric_checkpoint(recon_checkpoint, trace_checkpoint)
+            purification_trace = {
+                'stage': 'purification',
+                'main_iteration': i + 1,
+                'sub_iteration': None,
+                'ddim_timestep': int(ddim_timestep),
+                'elapsed_seconds': time.perf_counter() - trace_start_time,
+            }
+            append_metric_checkpoint(x, purification_trace)
         if record_reconstructions:
             x_list_complete = x_list_complete + x_list_sub
             x_trace_complete = x_trace_complete + x_trace_sub
@@ -655,7 +689,7 @@ def Diffusion_Purified_CSGM(model, img_gt, total_num_iterations, csgm_num_iterat
                 plt.imshow(torch_to_np(normalize_image(x_purified)))
                 fig_name = 'Iter_'+str(i)+'.png'
                 plt.savefig(root_path+fig_name)
-    return x, x_list_complete, x_trace_complete
+    return x, x_list_complete, x_trace_complete, metric_history
 
 
 def main():
@@ -985,7 +1019,7 @@ def main():
 
       try:
         solver_start_time = time.perf_counter()
-        x, x_list_complete, x_trace_complete = Diffusion_Purified_CSGM(model, img_gt=img, total_num_iterations=total_num_iterations,
+        x, x_list_complete, x_trace_complete, batch_metric_history = Diffusion_Purified_CSGM(model, img_gt=img, total_num_iterations=total_num_iterations,
                                                       csgm_num_iterations=csgm_num_iterations, device=device,
                                                       cond_method=cond_method, ddim_init_timestep=ddim_init_timestep,
                                                       ddim_end_timestep=ddim_end_timestep, operator=operator,
@@ -997,7 +1031,9 @@ def main():
                                                       save_every_sub=save_every_sub, verbose=args.save_progress_figures,
                                                       root_path=figure_root_path,
                                                       save_measurements=args.save_measurements,
-                                                      record_reconstructions=(args.save_recon_history or args.save_metric_history or args.save_quality_history or not args.skip_metrics))
+                                                      record_reconstructions=(args.save_recon_history or args.save_quality_history or not args.skip_metrics),
+                                                      record_metric_history=(args.save_metric_history or args.save_quality_history),
+                                                      metric_lpips=lpips)
         solver_elapsed_seconds = time.perf_counter() - solver_start_time
       
         # Save the intermediate reconstructions
@@ -1028,9 +1064,6 @@ def main():
         batch_quality_history = [[] for _ in batch_indices]
         if args.save_quality_history:
           batch_quality_history = compute_quality_history_records(img, x_list_complete, x_trace_complete, lpips, device)
-        batch_metric_history = None
-        if args.save_metric_history or args.save_quality_history:
-          batch_metric_history = compute_metric_history_records(img, x_list_complete, x_trace_complete, lpips, device)
         final_metrics = {}
         PSNR_list = []
         SSIM_list = []
@@ -1151,7 +1184,7 @@ def main():
           new_image_records.append(image_record)
         history_records.extend(new_image_records)
         quality_history_records.extend(new_quality_history_records)
-        if batch_metric_history is not None:
+        if args.save_metric_history or args.save_quality_history:
           metric_history_batches.append({'batch_size': batch_count, 'history': batch_metric_history})
         metric_history = combine_metric_history_batches(metric_history_batches)
         write_json(history_json, {'run': run_summary, 'images': history_records})
