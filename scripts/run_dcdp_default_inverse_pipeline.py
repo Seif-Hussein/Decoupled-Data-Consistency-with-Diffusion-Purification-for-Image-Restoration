@@ -77,6 +77,7 @@ def main() -> int:
     parser.add_argument("--save-measurements", action="store_true")
     parser.add_argument("--save-progress-figures", action="store_true")
     parser.add_argument("--save-recon-history", action="store_true")
+    parser.add_argument("--save-quality-history", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -127,10 +128,13 @@ def main() -> int:
             cmd.append("--save_progress_figures")
         if args.save_recon_history:
             cmd.append("--save_recon_history")
+        if args.save_quality_history:
+            cmd.append("--save_quality_history")
         output_name = task["output_name"]
         print(f"\n=== {task_name} ({task['source']} preset) ===")
         print(f"Progress JSON: {args.save_dir / output_name / 'progress.json'}")
         print(f"History JSON: {args.save_dir / output_name / 'history.json'}")
+        print(f"Quality history JSON: {args.save_dir / output_name / 'quality_history.json'}")
         print(f"Generated images zip: {args.save_dir / output_name / 'generated_images.zip'}")
         print(" ".join(cmd))
         if not args.dry_run:

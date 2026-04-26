@@ -163,6 +163,23 @@ def compute_final_quality_metrics(gt_batch, recon_batch, lpips_metric, device):
     metrics.append(sample_metrics)
   return metrics
 
+def compute_quality_history_records(gt_batch, recon_batches, trace_records, lpips_metric, device):
+  records_by_sample = [[] for _ in range(gt_batch.shape[0])]
+  for checkpoint_idx, recon_batch in enumerate(recon_batches):
+    sample_metrics = compute_final_quality_metrics(gt_batch, recon_batch, lpips_metric, device)
+    trace = trace_records[checkpoint_idx] if checkpoint_idx < len(trace_records) else {}
+    for sample_idx, metrics in enumerate(sample_metrics):
+      record = dict(trace)
+      record.setdefault('checkpoint_index', checkpoint_idx)
+      if 'final_psnr' in metrics:
+        record['psnr'] = metrics['final_psnr']
+      if 'final_ssim' in metrics:
+        record['ssim'] = metrics['final_ssim']
+      if 'final_lpips' in metrics:
+        record['lpips'] = metrics['final_lpips']
+      records_by_sample[sample_idx].append(record)
+  return records_by_sample
+
 def _as_pair(value, default):
   if value is None:
     value = default
@@ -270,7 +287,8 @@ def Purification_Schedule(num_purification_steps, initial_timestep, end_timestep
   return timesteps
 
 def CSGM_Solver_Pixel_Space(measurements, x_init, num_iterations, device, operator, use_weight_decay=False, weight_decay_lambda=0, 
-                            mask=None, optimizer = 'SGD', momentum=0.9, type='L2', lr=0.1, save_every=50, verbose=False):
+                            mask=None, optimizer = 'SGD', momentum=0.9, type='L2', lr=0.1, save_every=50, verbose=False,
+                            trace_start_time=None, main_iteration=None, ddim_timestep=None):
   '''
   This is the solver for the data fidelity optimization problem: 1/2||A(x)-y||_2^2 + weight_decay*||x-x_k||
   x_init: initial point x_k
@@ -286,6 +304,7 @@ def CSGM_Solver_Pixel_Space(measurements, x_init, num_iterations, device, operat
     # Momentum accelerates the reconstruction speed, which ususally leads to better results (0.9)
     optimizer = torch.optim.SGD([x],lr=lr,momentum=momentum)
   x_list = []
+  trace_records = []
 
   measurements = measurements.clone().detach()
 
@@ -304,14 +323,21 @@ def CSGM_Solver_Pixel_Space(measurements, x_init, num_iterations, device, operat
     optimizer.step()
 
     if i % save_every == 0 or i == num_iterations-1:
-      x_list.append(x.clone().detach())
+      x_list.append(x.clone().detach().cpu())
+      trace_records.append({
+          'stage': 'csgm',
+          'main_iteration': main_iteration,
+          'sub_iteration': i + 1,
+          'ddim_timestep': int(ddim_timestep) if ddim_timestep is not None else None,
+          'elapsed_seconds': time.perf_counter() - trace_start_time if trace_start_time is not None else None,
+      })
       if verbose == True:
         plt.figure()
         plt.title('Iter: '+str(i+1))
         plt.imshow(torch_to_np(recon))
         plt.show()
     
-  return x_list[-1], x_list
+  return x.clone().detach(), x_list, trace_records
 
 def Diffusion_Purified_CSGM(model, img_gt, total_num_iterations, csgm_num_iterations, device, cond_method,
                             ddim_init_timestep, ddim_end_timestep, operator, inverse_problem_type, noise_std, 
@@ -358,6 +384,8 @@ def Diffusion_Purified_CSGM(model, img_gt, total_num_iterations, csgm_num_iterat
 
     x = torch.zeros(img_gt.shape, device=device, requires_grad=True)
     x_list_complete = []
+    x_trace_complete = []
+    trace_start_time = time.perf_counter()
     # Initialize the purification timesteps
     purification_timesteps = Purification_Schedule(total_num_iterations, ddim_init_timestep, ddim_end_timestep, schedule_type=purification_schedule)
 
@@ -375,11 +403,14 @@ def Diffusion_Purified_CSGM(model, img_gt, total_num_iterations, csgm_num_iterat
         ddim_timestep = purification_timesteps[i]
 
         # Step 1: Perform data fidelity optimization with graidient descent (csgm)
-        x, x_list_sub = CSGM_Solver_Pixel_Space(measurements, x, csgm_num_iterations,
+        x, x_list_sub, x_trace_sub = CSGM_Solver_Pixel_Space(measurements, x, csgm_num_iterations,
                                     device, use_weight_decay=use_weight_decay, 
                                     weight_decay_lambda=weight_decay_lambda, 
                                     operator=operator, mask=mask, optimizer=optimizer, 
-                                    momentum=momentum, lr=lr, save_every=save_every_sub)
+                                    momentum=momentum, lr=lr, save_every=save_every_sub,
+                                    trace_start_time=trace_start_time,
+                                    main_iteration=i + 1,
+                                    ddim_timestep=int(ddim_timestep))
 
         # Step 2: Purify the current x with the pretraind diffusion model
         
@@ -430,7 +461,15 @@ def Diffusion_Purified_CSGM(model, img_gt, total_num_iterations, csgm_num_iterat
         x = x_purified
         if record_reconstructions:
             x_list_complete = x_list_complete + x_list_sub
-            x_list_complete.append(x)
+            x_trace_complete = x_trace_complete + x_trace_sub
+            x_list_complete.append(x.clone().detach().cpu())
+            x_trace_complete.append({
+                'stage': 'purification',
+                'main_iteration': i + 1,
+                'sub_iteration': None,
+                'ddim_timestep': int(ddim_timestep),
+                'elapsed_seconds': time.perf_counter() - trace_start_time,
+            })
 
         if i % save_every_main == 0 or i==total_num_iterations-1:
             if verbose == True:
@@ -449,7 +488,7 @@ def Diffusion_Purified_CSGM(model, img_gt, total_num_iterations, csgm_num_iterat
                 plt.imshow(torch_to_np(normalize_image(x_purified)))
                 fig_name = 'Iter_'+str(i)+'.png'
                 plt.savefig(root_path+fig_name)
-    return x, x_list_complete
+    return x, x_list_complete, x_trace_complete
 
 
 def main():
@@ -483,6 +522,8 @@ def main():
                       help='Save per-iteration progress figures.')
   parser.add_argument('--save_recon_history', action='store_true',
                       help='Save x_list_complete.pt and retain intermediate reconstructions when metrics are skipped.')
+  parser.add_argument('--save_quality_history', action='store_true',
+                      help='Write quality_history.json with PSNR/SSIM/LPIPS versus elapsed solver time at reconstruction checkpoints.')
   args = parser.parse_args()
 
   # logger
@@ -624,6 +665,7 @@ def main():
 
   progress_json = os.path.join(out_path, 'progress.json')
   history_json = os.path.join(out_path, 'history.json')
+  quality_history_json = os.path.join(out_path, 'quality_history.json')
   generated_images_dir = os.path.join(out_path, 'generated_images')
   generated_images_zip = os.path.join(out_path, 'generated_images.zip')
   os.makedirs(generated_images_dir, exist_ok=True)
@@ -656,8 +698,18 @@ def main():
       'save_measurements': args.save_measurements,
       'save_progress_figures': args.save_progress_figures,
       'save_recon_history': args.save_recon_history,
+      'save_quality_history': args.save_quality_history,
       'output_dir': out_path,
       'run_output_dir': path_0,
+      'quality_history_json': quality_history_json,
+      'quality_history_checkpointing': {
+          'enabled': args.save_quality_history,
+          'x_axis': 'elapsed_seconds',
+          'metrics': ['psnr', 'ssim', 'lpips'],
+          'save_every_sub': save_every_sub,
+          'records_csgm_final_step_even_when_save_every_sub_is_large': True,
+          'records_purification_steps': True,
+      },
       'generated_images_dir': generated_images_dir,
       'generated_images_zip': generated_images_zip,
       'started_at': run_started_at,
@@ -677,9 +729,11 @@ def main():
       },
   }
   history_records = []
+  quality_history_records = []
   generated_image_records = []
   write_image_zip(generated_image_records, generated_images_zip)
   write_json(history_json, {'run': run_summary, 'images': history_records})
+  write_json(quality_history_json, {'run': run_summary, 'images': quality_history_records})
   write_json(progress_json, {
       'run': run_summary,
       'status': 'starting',
@@ -689,6 +743,7 @@ def main():
       'avg_elapsed_seconds_per_image': None,
       'eta_seconds': None,
       'history_json': history_json,
+      'quality_history_json': quality_history_json,
       'generated_images_dir': generated_images_dir,
       'generated_images_zip': generated_images_zip,
       'updated_at': utc_now_iso(),
@@ -743,6 +798,7 @@ def main():
           'avg_elapsed_seconds_per_image': avg_elapsed,
           'eta_seconds': eta_seconds,
           'history_json': history_json,
+          'quality_history_json': quality_history_json,
           'generated_images_dir': generated_images_dir,
           'generated_images_zip': generated_images_zip,
           'updated_at': utc_now_iso(),
@@ -750,7 +806,7 @@ def main():
 
       try:
         solver_start_time = time.perf_counter()
-        x, x_list_complete = Diffusion_Purified_CSGM(model, img_gt=img, total_num_iterations=total_num_iterations,
+        x, x_list_complete, x_trace_complete = Diffusion_Purified_CSGM(model, img_gt=img, total_num_iterations=total_num_iterations,
                                                       csgm_num_iterations=csgm_num_iterations, device=device,
                                                       cond_method=cond_method, ddim_init_timestep=ddim_init_timestep,
                                                       ddim_end_timestep=ddim_end_timestep, operator=operator,
@@ -762,7 +818,7 @@ def main():
                                                       save_every_sub=save_every_sub, verbose=args.save_progress_figures,
                                                       root_path=figure_root_path,
                                                       save_measurements=args.save_measurements,
-                                                      record_reconstructions=(args.save_recon_history or not args.skip_metrics))
+                                                      record_reconstructions=(args.save_recon_history or args.save_quality_history or not args.skip_metrics))
         solver_elapsed_seconds = time.perf_counter() - solver_start_time
       
         # Save the intermediate reconstructions
@@ -790,6 +846,9 @@ def main():
         final_metrics_by_sample = [{} for _ in batch_indices]
         if args.final_metrics or not args.skip_metrics:
           final_metrics_by_sample = compute_final_quality_metrics(img, x, lpips, device)
+        batch_quality_history = [[] for _ in batch_indices]
+        if args.save_quality_history:
+          batch_quality_history = compute_quality_history_records(img, x_list_complete, x_trace_complete, lpips, device)
         final_metrics = {}
         PSNR_list = []
         SSIM_list = []
@@ -869,8 +928,10 @@ def main():
         batch_elapsed_seconds = time.perf_counter() - image_start_time
         ended_at = utc_now_iso()
         new_image_records = []
+        new_quality_history_records = []
         for sample_offset, dataset_index in enumerate(batch_indices):
           generated = batch_generated[sample_offset]
+          sample_quality_history = batch_quality_history[sample_offset] if sample_offset < len(batch_quality_history) else []
           image_record = {
               'dataset_index': dataset_index,
               'processed_image': processed_images - batch_count + sample_offset + 1,
@@ -889,13 +950,26 @@ def main():
               'batch_dataset_indices': batch_indices,
               'num_recorded_reconstructions': len(x_list_complete),
               'num_saved_reconstructions': len(x_list_complete) if saved_recon_history else 0,
+              'quality_history_json': quality_history_json if args.save_quality_history else None,
+              'num_quality_history_points': len(sample_quality_history),
               'generated_image': generated['path'],
               'generated_image_zip_member': generated['arcname'],
               'metrics': final_metrics_by_sample[sample_offset],
           }
+          if args.save_quality_history:
+            new_quality_history_records.append({
+                'dataset_index': dataset_index,
+                'processed_image': image_record['processed_image'],
+                'image_path': batch_image_paths[sample_offset],
+                'generated_image': generated['path'],
+                'output_dir': root_path,
+                'history': sample_quality_history,
+            })
           new_image_records.append(image_record)
         history_records.extend(new_image_records)
+        quality_history_records.extend(new_quality_history_records)
         write_json(history_json, {'run': run_summary, 'images': history_records})
+        write_json(quality_history_json, {'run': run_summary, 'images': quality_history_records})
         avg_elapsed, eta_seconds = elapsed_summary(history_records, target_images)
         write_json(progress_json, {
             'run': run_summary,
@@ -907,6 +981,7 @@ def main():
             'avg_elapsed_seconds_per_image': avg_elapsed,
             'eta_seconds': eta_seconds,
             'history_json': history_json,
+            'quality_history_json': quality_history_json,
             'generated_images_dir': generated_images_dir,
             'generated_images_zip': generated_images_zip,
             'updated_at': utc_now_iso(),
@@ -928,6 +1003,7 @@ def main():
             'avg_elapsed_seconds_per_image': avg_elapsed,
             'eta_seconds': eta_seconds,
             'history_json': history_json,
+            'quality_history_json': quality_history_json,
             'generated_images_dir': generated_images_dir,
             'generated_images_zip': generated_images_zip,
             'updated_at': utc_now_iso(),
@@ -1000,6 +1076,7 @@ def main():
   run_summary['completed_images'] = processed_images
   write_image_zip(generated_image_records, generated_images_zip)
   write_json(history_json, {'run': run_summary, 'images': history_records})
+  write_json(quality_history_json, {'run': run_summary, 'images': quality_history_records})
   write_json(progress_json, {
       'run': run_summary,
       'status': 'completed',
@@ -1010,6 +1087,7 @@ def main():
       'avg_elapsed_seconds_per_image': avg_elapsed,
       'eta_seconds': eta_seconds,
       'history_json': history_json,
+      'quality_history_json': quality_history_json,
       'generated_images_dir': generated_images_dir,
       'generated_images_zip': generated_images_zip,
       'updated_at': utc_now_iso(),
